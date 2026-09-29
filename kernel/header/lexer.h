@@ -38,8 +38,6 @@ enum class TokenType {
 
     EQ,
     PLUSPLUS,
-    ARGS,
-    AT_ARGS,
     DOT,
 
     USELIB,

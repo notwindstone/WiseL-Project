@@ -3,7 +3,6 @@ setlocal
 
 set "INCLUDE=kernel\FASM\fasm2\include"
 
-wiselc.exe
 if %errorlevel% neq 0 (
     echo [ERROR] WiseL compiler failed
     pause

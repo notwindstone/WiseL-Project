@@ -19,8 +19,11 @@ enum class NodeType {
     INC_STMT,
     USELIB,
     INCLUDE_BLOCK,
-    VARIADIC_BODY,
-    BINARY_OP
+    BINARY_OP,
+    LITERAL,
+    IDENT_REF,
+    INDEX_EXPR,
+    ASSIGN_STMT
 };
 
 // AST Node Structure
@@ -31,6 +34,7 @@ struct ASTNode {
     // Function definition body and parameters
     std::vector<ASTNode> body;
     std::vector<std::string> params;
+    std::vector<std::string> param_types;
 
     // Inline Assembly and Imports
     std::vector<std::string> asm_lines;
@@ -48,10 +52,6 @@ struct ASTNode {
     std::vector<std::string> args;
     std::string condition;
     std::vector<ASTNode> else_body;
-
-    // Variadic functions
-    bool is_variadic = false;
-    std::vector<ASTNode> variadic_body;
 
     // Function Return Type
     std::string return_type;

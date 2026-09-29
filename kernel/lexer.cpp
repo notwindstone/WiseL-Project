@@ -40,19 +40,39 @@ string read_number(const string& src, size_t& pos) {
 // Map keyword string to token type
 TokenType get_keyword_type(const string& word) {
     if (word == "func") return TokenType::FUNC;
-    if (word == "if")   return TokenType::IF;
+    if (word == "if") return TokenType::IF;
     if (word == "else") return TokenType::ELSE;
-    if (word == "while")    return TokenType::WHILE;
-    if (word == "break")    return TokenType::BREAK;
-    if (word == "let")  return TokenType::LET;
-    if (word == "mut")  return TokenType::MUT;
-    if (word == "asm")  return TokenType::ASM;
-    if (word == "static")   return TokenType::STATIC;
-    if (word == "return")   return TokenType::RETURN;
-    if (word == "Format")   return TokenType::FORMAT;
-    if (word == "UseLib")   return TokenType::USELIB;
+    if (word == "while") return TokenType::WHILE;
+    if (word == "break") return TokenType::BREAK;
+    if (word == "let") return TokenType::LET;
+    if (word == "mut") return TokenType::MUT;
+    if (word == "asm") return TokenType::ASM;
+    if (word == "static") return TokenType::STATIC;
+    if (word == "return") return TokenType::RETURN;
+    if (word == "Format") return TokenType::FORMAT;
+    if (word == "UseLib") return TokenType::USELIB;
     return TokenType::IDENT;
 }
+
+struct OpToken { const char* text; TokenType type; };
+
+static const OpToken OP_TABLE[] = {
+    {"->", TokenType::ARROW},
+    {"==", TokenType::EQ},
+    {"++", TokenType::PLUSPLUS},
+    {"<=", TokenType::IDENT},
+    {">=", TokenType::IDENT},
+    {"!=", TokenType::IDENT},
+    {"=",  TokenType::ASSIGN},
+    {"+",  TokenType::IDENT},
+    {"-",  TokenType::IDENT},
+    {"*",  TokenType::IDENT},
+    {"<",  TokenType::IDENT},
+    {">",  TokenType::IDENT},
+    {"!",  TokenType::IDENT},
+    {"/",  TokenType::DIV},
+    {"%",  TokenType::MOD},
+};
 
 // Convert source code string into token vector
 vector<Token> tokenize(const string& source) {
@@ -64,6 +84,30 @@ vector<Token> tokenize(const string& source) {
         if (pos >= source.size()) break;
 
         char ch = source[pos];
+
+        if (ch == '-' && pos + 1 < source.size() && isdigit(source[pos + 1])) {
+            pos++;
+            string num = "-" + read_number(source, pos);
+            tokens.push_back({TokenType::NUMBER, num});
+            continue;
+        }
+
+        if (ch == '/' && pos + 1 < source.size() && source[pos + 1] == '/') {
+            while (pos < source.size() && source[pos] != '\n') pos++;
+            continue;
+        }
+
+        bool op_matched = false;
+        for (const auto& ot : OP_TABLE) {
+            string op = ot.text;
+            if (source.compare(pos, op.size(), op) == 0) {
+                tokens.push_back({ot.type, op});
+                pos += op.size();
+                op_matched = true;
+                break;
+            }
+        }
+        if (op_matched) continue;
 
         switch (ch) {
             case '(':tokens.push_back({TokenType::LPAREN, "("});pos++;break;
@@ -77,7 +121,7 @@ vector<Token> tokenize(const string& source) {
 
             case ',':tokens.push_back({TokenType::COMMA, ","});pos++;break;
             case '\n':tokens.push_back({TokenType::NEWLINE, "\n"});pos++;break;
-            case '"': { tokens.push_back({TokenType::STRING, read_string(source, pos)}); break; }
+            case '"': tokens.push_back({TokenType::STRING, read_string(source, pos)}); break;
             case '\'': {
                 string result = "'"; pos++;
                 while (pos < source.size() && source[pos] != '\'') {
@@ -87,57 +131,12 @@ vector<Token> tokenize(const string& source) {
                 if (pos < source.size()) pos++;
                 tokens.push_back({TokenType::STRING, result}); break;
             }
-            case '=': {
-                if (pos + 1 < source.size() && source[pos + 1] == '=') {
-                    tokens.push_back({TokenType::EQ, "=="});
-                    pos += 2;
-                }
-                else {
-                    tokens.push_back({TokenType::ASSIGN, "="});
-                    pos++;
-                }
-                break;
-            }
-            case '+':
-                if (pos + 1 < source.size() && source[pos + 1] == '+') {
-                    tokens.push_back({TokenType::PLUSPLUS, "++"});
-                    pos += 2;
-                } else {
-                    tokens.push_back({TokenType::IDENT, "+"});
-                    pos++;
-                }
-                break;
-
-            case '-': {
-                if (pos + 1 < source.size() && source[pos + 1] == '>') {
-                    tokens.push_back({TokenType::ARROW, "->"});
-                    pos += 2;
-                }
-                else if (pos + 1 < source.size() && isdigit(source[pos + 1])) {
-                    pos++;
-                    string num = "-" + read_number(source, pos);
-                    tokens.push_back({TokenType::NUMBER, num});
-                }
-                else {
-                    tokens.push_back({TokenType::IDENT, "-"});
-                    pos++;
-                }
-                break;
-            }
 
             // preprocessors
             case '@': {
                 pos++;
                 if (pos < source.size() && isalpha(source[pos])) {
                     string word = read_identifier(source, pos);
-                    if (word == "args") {
-                        if (pos < source.size() && source[pos] == '[') {pos++;
-                            if (pos < source.size() && source[pos] == ']') {pos++;
-                                tokens.push_back({TokenType::AT_ARGS, "@args[]"});
-                                break;
-                            }
-                        }
-                    }
                     while (pos < source.size() && source[pos] != ' ' && source[pos] != '\t' &&
                         source[pos] != '{' && source[pos] != '\n' && source[pos] != '\r') {
                         word += source[pos];
@@ -180,9 +179,6 @@ vector<Token> tokenize(const string& source) {
                 break;
             }
 
-            case '/':tokens.push_back({TokenType::DIV, "/"});pos++;break;
-            case '%':tokens.push_back({TokenType::MOD, "%"});pos++;break;
-
             default:
                 if (isdigit(ch)) {
                     string num = read_number(source, pos);
@@ -190,19 +186,8 @@ vector<Token> tokenize(const string& source) {
                 }
                 else if (isalpha(ch) || ch == '_') {
                     string word = read_identifier(source, pos);
-
-                    if (word == "args") {
-                        if (pos + 1 < source.size() && source[pos] == '[' && source[pos + 1] == ']') {
-                            pos += 2;
-                            tokens.push_back({TokenType::ARGS, "args[]"});
-                        } else {
-                            tokens.push_back({TokenType::IDENT, word});
-                        }
-                    }
-                    else {
-                        TokenType type = get_keyword_type(word);
-                        tokens.push_back({type, word});
-                    }
+                    TokenType type = get_keyword_type(word);
+                    tokens.push_back({type, word});
                 }
                 else {
                     tokens.push_back({TokenType::IDENT, string(1, ch)});

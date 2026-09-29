@@ -4,42 +4,6 @@
 
 using namespace std;
 
-// Parse conditional expression into BINARY_OP node
-static shared_ptr<ASTNode> parse_condition_expr(const vector<Token>& expr_tokens) {
-    int op_idx = -1;
-    for (size_t i = 0; i < expr_tokens.size(); i++) {
-        string v = expr_tokens[i].value;
-        if (v == "==" || v == "!=" || v == "<=" || v == ">=" || v == "<" || v == ">") {
-            op_idx = i;
-            break;
-        }
-    }
-    if (op_idx == -1) return nullptr;
-
-    auto bin_node = make_shared<ASTNode>();
-    bin_node->type = NodeType::BINARY_OP;
-    bin_node->op = expr_tokens[op_idx].value;
-
-    string left_val;
-    for (int i = 0; i < op_idx; i++) {
-        if (!left_val.empty()) left_val += " ";
-        left_val += expr_tokens[i].value;
-    }
-    bin_node->left = make_shared<ASTNode>();
-    bin_node->left->value = left_val;
-
-    string right_val;
-    for (size_t i = op_idx + 1; i < (int)expr_tokens.size(); i++) {
-        if (!right_val.empty()) right_val += " ";
-        right_val += expr_tokens[i].value;
-    }
-    bin_node->right = make_shared<ASTNode>();
-    bin_node->right->value = right_val;
-
-    return bin_node;
-}
-
-
 // Check if character requires leading whitespace in reconstructed output
 bool needs_space_before(const string& val) {
     if (val.empty()) return false;
@@ -115,6 +79,118 @@ ASTNode parse_asm_block(const vector<Token>& tokens, size_t& pos) {
     return node;
 }
 
+static int bin_prec(const string& op) {
+    if (op == "*" || op == "/" || op == "%") return 2;
+    if (op == "+" || op == "-") return 1;
+    return -1;
+}
+
+static shared_ptr<ASTNode> parse_expr_from(const vector<Token>& tks, size_t& i, int min_prec);
+
+static shared_ptr<ASTNode> parse_primary_from(const vector<Token>& tks, size_t& i) {
+    if (i >= tks.size()) return nullptr;
+
+    if (tks[i].type == TokenType::NUMBER) {
+        auto n = make_shared<ASTNode>();
+        n->type = NodeType::LITERAL;
+        n->value = tks[i].value;
+        i++;
+        return n;
+    }
+
+    if (tks[i].type == TokenType::STRING && tks[i].value.size() == 3 && tks[i].value[0] == '\'') {
+        auto n = make_shared<ASTNode>();
+        n->type = NodeType::LITERAL;
+        n->value = to_string((int)(unsigned char)tks[i].value[1]);
+        i++;
+        return n;
+    }
+
+    if (tks[i].type == TokenType::LPAREN) {
+        i++;
+        auto inner = parse_expr_from(tks, i, 0);
+        if (i < tks.size() && tks[i].type == TokenType::RPAREN) i++;
+        return inner;
+    }
+
+    if (tks[i].type == TokenType::IDENT) {
+        string name = tks[i].value;
+        i++;
+        if (i < tks.size() && tks[i].type == TokenType::LBRACKET) {
+            i++;
+            auto idx = parse_expr_from(tks, i, 0);
+            if (i < tks.size() && tks[i].type == TokenType::RBRACKET) i++;
+            auto node = make_shared<ASTNode>();
+            node->type = NodeType::INDEX_EXPR;
+            node->left = make_shared<ASTNode>();
+            node->left->type = NodeType::IDENT_REF;
+            node->left->value = name;
+            node->right = idx;
+            return node;
+        }
+        auto n = make_shared<ASTNode>();
+        n->type = NodeType::IDENT_REF;
+        n->value = name;
+        return n;
+    }
+
+    return nullptr;
+}
+
+static shared_ptr<ASTNode> parse_expr_from(const vector<Token>& tks, size_t& i, int min_prec) {
+    shared_ptr<ASTNode> left;
+
+    if (i < tks.size() && tks[i].type == TokenType::IDENT && tks[i].value == "-") {
+        i++;
+        auto operand = parse_expr_from(tks, i, 2);
+        auto node = make_shared<ASTNode>();
+        node->type = NodeType::BINARY_OP;
+        node->op = "u-";
+        node->right = operand;
+        left = node;
+    } else {
+        left = parse_primary_from(tks, i);
+    }
+
+    if (!left) return nullptr;
+
+    while (i < tks.size()) {
+        int prec = bin_prec(tks[i].value);
+        if (prec == -1 || prec < min_prec) break;
+        string op = tks[i].value;
+        i++;
+        auto right = parse_expr_from(tks, i, prec + 1);
+        if (!right) break;
+        auto node = make_shared<ASTNode>();
+        node->type = NodeType::BINARY_OP;
+        node->op = op;
+        node->left = left;
+        node->right = right;
+        left = node;
+    }
+    return left;
+}
+
+static void parse_rvalue_expr(const vector<Token>& tokens, size_t& pos, ASTNode& node, TokenType stop_token) {
+    vector<Token> expr_tokens;
+    while (pos < tokens.size() && tokens[pos].type != TokenType::NEWLINE && tokens[pos].type != stop_token) {
+        expr_tokens.push_back(tokens[pos]);
+        pos++;
+    }
+    size_t ei = 0;
+    auto tree = parse_expr_from(expr_tokens, ei, 0);
+    if (tree && ei == expr_tokens.size()) {
+        node.expr = tree;
+    } else {
+        string val;
+        for (const auto& t : expr_tokens) {
+            if (!val.empty()) val += " ";
+            val += t.value;
+        }
+        node.var_value = val;
+    }
+}
+
 // Parse variable declarations (let / static)
 ASTNode parse_let_stmt(const vector<Token>& tokens, size_t& pos, bool is_static, bool is_func_local) {
     ASTNode node;
@@ -143,62 +219,81 @@ ASTNode parse_let_stmt(const vector<Token>& tokens, size_t& pos, bool is_static,
         node.var_type += tokens[pos].value;
         pos++;
     }
+    // Parse array type definitions (str[], i32[], any[])
+    if (pos < tokens.size() && tokens[pos].type == TokenType::LBRACKET) {
+        pos++;
+        if (pos < tokens.size() && tokens[pos].type == TokenType::RBRACKET) {
+            node.var_type += "[]";
+            pos++;
+        }
+    }
 
     if (pos < tokens.size() && tokens[pos].type == TokenType::ASSIGN) {
         pos++;
-        vector<Token> expr_tokens;
-        while (pos < tokens.size() && tokens[pos].type != TokenType::NEWLINE) {
-            expr_tokens.push_back(tokens[pos]);
+        // Parse array literal ["a", "b", "c"]
+        if (pos < tokens.size() && tokens[pos].type == TokenType::LBRACKET) {
             pos++;
+            vector<string> array_elements;
+            while (pos < tokens.size() && tokens[pos].type != TokenType::RBRACKET) {
+                if (tokens[pos].type == TokenType::COMMA) {
+                    pos++;
+                    continue;
+                }
+                if (tokens[pos].type == TokenType::STRING || tokens[pos].type == TokenType::NUMBER || tokens[pos].type == TokenType::IDENT) {
+                    array_elements.push_back(tokens[pos].value);
+                }
+                pos++;
+            }
+            if (pos < tokens.size() && tokens[pos].type == TokenType::RBRACKET) {
+                pos++;
+            }
+            // Store array elements in var_value as comma-separated
+            string joined;
+            for (size_t i = 0; i < array_elements.size(); i++) {
+                if (i > 0) joined += ",";
+                joined += array_elements[i];
+            }
+            node.var_value = "[" + joined + "]";
         }
-
-        // Search for binary arithmetic operators (+, -, *, /, %)
-        int op_idx = -1;
-        for (size_t i = 0; i < expr_tokens.size(); i++) {
-            string v = expr_tokens[i].value;
-            if (v == "+" || v == "-" || v == "*" || v == "/" || v == "%") {
-                // Ignore leading unary minus (e.g. -5)
-                if (v == "-" && i == 0) continue; 
-                op_idx = i;
-                break;
-            }
-        }
-
-        // Construct BINARY_OP node if operator is found
-        if (op_idx != -1) {
-            auto bin_node = make_shared<ASTNode>();
-            bin_node->type = NodeType::BINARY_OP;
-            bin_node->op = expr_tokens[op_idx].value;
-
-            // Assemble left-hand side operand
-            string left_val;
-            for (int i = 0; i < op_idx; i++) {
-                if (!left_val.empty()) left_val += " ";
-                left_val += expr_tokens[i].value;
-            }
-            bin_node->left = make_shared<ASTNode>();
-            bin_node->left->value = left_val;
-
-            // Assemble right-hand side operand
-            string right_val;
-            for (size_t i = op_idx + 1; i < expr_tokens.size(); i++) {
-                if (!right_val.empty()) right_val += " ";
-                right_val += expr_tokens[i].value;
-            }
-            bin_node->right = make_shared<ASTNode>();
-            bin_node->right->value = right_val;
-
-            node.expr = bin_node; 
-        } else {
-            // Standard scalar or literal assignment
-            string val;
-            for (const auto& t : expr_tokens) {
-                if (!val.empty()) val += " ";
-                val += t.value;
-            }
-            node.var_value = val;
+        else {
+            parse_rvalue_expr(tokens, pos, node, TokenType::NEWLINE);
         }
     }
+    return node;
+}
+
+static ASTNode parse_block(const vector<Token>& tokens, size_t& pos);
+
+static ASTNode parse_cond_and_body(const vector<Token>& tokens, size_t& pos, NodeType type, bool has_else = false) {
+    ASTNode node;
+    node.type = type;
+    pos++;
+
+    if (pos < tokens.size() && tokens[pos].type == TokenType::LPAREN) {
+        pos++;
+        string cond;
+        while (pos < tokens.size() && tokens[pos].type != TokenType::RPAREN) {
+            if (!cond.empty()) cond += " ";
+            cond += tokens[pos].value;
+            pos++;
+        }
+        if (pos < tokens.size() && tokens[pos].type == TokenType::RPAREN) pos++;
+        node.condition = cond;
+    }
+
+    if (pos < tokens.size() && tokens[pos].type == TokenType::LBRACE) {
+        ASTNode body = parse_block(tokens, pos);
+        node.body = body.body;
+    }
+
+    if (has_else && pos < tokens.size() && tokens[pos].type == TokenType::ELSE) {
+        pos++;
+        if (pos < tokens.size() && tokens[pos].type == TokenType::LBRACE) {
+            ASTNode else_body = parse_block(tokens, pos);
+            node.else_body = else_body.body;
+        }
+    }
+
     return node;
 }
 
@@ -224,75 +319,17 @@ ASTNode parse_block(const vector<Token>& tokens, size_t& pos) {
                 ASTNode ret_node;
                 ret_node.type = NodeType::RETURN_STMT;
                 pos++;
-                
+
                 if (pos < tokens.size() && tokens[pos].type != TokenType::NEWLINE && tokens[pos].type != TokenType::RBRACE) {
-                    string val;
-                    while (pos < tokens.size() && tokens[pos].type != TokenType::NEWLINE && tokens[pos].type != TokenType::RBRACE) {
-                        if (!val.empty()) val += " ";
-                        val += tokens[pos].value;
-                        pos++;
-                    }
-                    ret_node.var_value = val;
+                    parse_rvalue_expr(tokens, pos, ret_node, TokenType::RBRACE);
                 }
                 block.body.push_back(ret_node);
             }
             else if (tokens[pos].type == TokenType::WHILE) {
-                ASTNode while_node;
-                while_node.type = NodeType::WHILE_STMT;
-                pos++;
-
-                if (pos < tokens.size() && tokens[pos].type == TokenType::LPAREN) {
-                    pos++;
-                    string cond;
-                    while (pos < tokens.size() && tokens[pos].type != TokenType::RPAREN) {
-                        if (!cond.empty()) cond += " ";
-                        cond += tokens[pos].value;
-                        pos++;
-                    }
-                    if (pos < tokens.size() && tokens[pos].type == TokenType::RPAREN) {
-                        pos++;
-                    }
-                    while_node.condition = cond;
-                }
-
-                if (pos < tokens.size() && tokens[pos].type == TokenType::LBRACE) {
-                    ASTNode body = parse_block(tokens, pos);
-                    while_node.body = body.body;
-                }
-                block.body.push_back(while_node);
+                block.body.push_back(parse_cond_and_body(tokens, pos, NodeType::WHILE_STMT));
             }
             else if (tokens[pos].type == TokenType::IF) {
-                ASTNode if_node;
-                if_node.type = NodeType::IF_STMT;
-                pos++;
-
-                if (pos < tokens.size() && tokens[pos].type == TokenType::LPAREN) {
-                    pos++;
-                    string cond;
-                    while (pos < tokens.size() && tokens[pos].type != TokenType::RPAREN) {
-                        if (!cond.empty()) cond += " ";
-                        cond += tokens[pos].value;
-                        pos++;
-                    }
-                    if (pos < tokens.size() && tokens[pos].type == TokenType::RPAREN) {
-                        pos++;
-                    }
-                    if_node.condition = cond;
-                }
-
-                if (pos < tokens.size() && tokens[pos].type == TokenType::LBRACE) {
-                    ASTNode body = parse_block(tokens, pos);
-                    if_node.body = body.body;
-                }
-
-                if (pos < tokens.size() && tokens[pos].type == TokenType::ELSE) {
-                    pos++;
-                    if (pos < tokens.size() && tokens[pos].type == TokenType::LBRACE) {
-                        ASTNode else_body = parse_block(tokens, pos);
-                        if_node.else_body = else_body.body;
-                    }
-                }
-                block.body.push_back(if_node);
+                block.body.push_back(parse_cond_and_body(tokens, pos, NodeType::IF_STMT, true));
             }
             else if (tokens[pos].type == TokenType::BREAK) {
                 ASTNode break_node;
@@ -300,22 +337,37 @@ ASTNode parse_block(const vector<Token>& tokens, size_t& pos) {
                 pos++;
                 block.body.push_back(break_node);
             }
-            else if (tokens[pos].type == TokenType::AT_ARGS) {
-                ASTNode var_body;
-                var_body.type = NodeType::VARIADIC_BODY;
-                pos++;
 
-                if (pos < tokens.size() && tokens[pos].type == TokenType::LBRACE) {
-                    ASTNode body = parse_block(tokens, pos);
-                    var_body.body = body.body;
-                }
-                block.body.push_back(var_body);
-            }
             else if (tokens[pos].type == TokenType::IDENT) {
                 string name = tokens[pos].value;
                 pos++;
 
-                if (pos < tokens.size() && tokens[pos].type == TokenType::PLUSPLUS) {
+                string target = name;
+                if (pos < tokens.size() && tokens[pos].type == TokenType::LBRACKET) {
+                    target += "[";
+                    pos++;
+                    int depth = 1;
+                    while (pos < tokens.size() && depth > 0) {
+                        if (tokens[pos].type == TokenType::LBRACKET) depth++;
+                        else if (tokens[pos].type == TokenType::RBRACKET) {
+                            depth--;
+                            if (depth == 0) { pos++; break; }
+                        }
+                        if (!tokens[pos].value.empty()) target += tokens[pos].value;
+                        pos++;
+                    }
+                    target += "]";
+                }
+
+                if (pos < tokens.size() && tokens[pos].type == TokenType::ASSIGN) {
+                    pos++;
+                    ASTNode assign_node;
+                    assign_node.type = NodeType::ASSIGN_STMT;
+                    assign_node.var_name = target;
+                    parse_rvalue_expr(tokens, pos, assign_node, TokenType::NEWLINE);
+                    block.body.push_back(assign_node);
+                }
+                else if (pos < tokens.size() && tokens[pos].type == TokenType::PLUSPLUS) {
                     ASTNode inc_node;
                     inc_node.type = NodeType::INC_STMT;
                     inc_node.var_name = name;
@@ -334,29 +386,31 @@ ASTNode parse_block(const vector<Token>& tokens, size_t& pos) {
                                 pos++;
                                 continue;
                             }
-                            if (tokens[pos].type == TokenType::IDENT && tokens[pos].value == "args" &&
-                                pos + 1 < tokens.size() && tokens[pos + 1].type == TokenType::LBRACKET) {
-                                string arg_str = "args";
+                            if (tokens[pos].type == TokenType::LBRACKET) {
+                                string arg_str = "[";
                                 pos++;
-                                int depth = 0;
-                                while (pos < tokens.size() && tokens[pos].type != TokenType::RPAREN) {
-                                    if (tokens[pos].type == TokenType::COMMA && depth == 0) break;
-                                    if (tokens[pos].type == TokenType::LBRACKET || tokens[pos].type == TokenType::LPAREN) depth++;
-                                    if (tokens[pos].type == TokenType::RBRACKET && depth > 0) depth--;
-                                    if (!tokens[pos].value.empty()) {
+                                int depth = 1;
+                                while (pos < tokens.size() && depth > 0) {
+                                    if (tokens[pos].type == TokenType::LBRACKET) depth++;
+                                    else if (tokens[pos].type == TokenType::RBRACKET) {
+                                        depth--;
+                                        if (depth == 0) { pos++; break; }
+                                    }
+                                    if (tokens[pos].type == TokenType::STRING) {
+                                        string val = tokens[pos].value;
+                                        if (val.size() >= 2 && val[0] == '"' && val.back() == '"') {
+                                            arg_str += val;
+                                        } else {
+                                            arg_str += "\"" + val + "\"";
+                                        }
+                                    } else if (tokens[pos].type == TokenType::COMMA) {
+                                        arg_str += ",";
+                                    } else if (!tokens[pos].value.empty()) {
                                         arg_str += tokens[pos].value;
                                     }
                                     pos++;
                                 }
-                                call_node.args.push_back(arg_str);
-                            }
-                            else if (tokens[pos].type == TokenType::ARGS) {
-                                string arg_str = "args[]";
-                                pos++;
-                                if (pos < tokens.size() && tokens[pos].type == TokenType::IDENT) {
-                                    arg_str += tokens[pos].value;
-                                    pos++;
-                                }
+                                arg_str += "]";
                                 call_node.args.push_back(arg_str);
                             }
                             else if (!tokens[pos].value.empty()) {
@@ -366,6 +420,22 @@ ASTNode parse_block(const vector<Token>& tokens, size_t& pos) {
                                     (tokens[pos].type == TokenType::IDENT || tokens[pos].type == TokenType::NUMBER)) {
                                     arg_val += tokens[pos].value;
                                     pos++;
+                                }
+                                // Handle array indexing: name[index]
+                                if (pos < tokens.size() && tokens[pos].type == TokenType::LBRACKET) {
+                                    arg_val += "[";
+                                    pos++;
+                                    int depth = 1;
+                                    while (pos < tokens.size() && depth > 0) {
+                                        if (tokens[pos].type == TokenType::LBRACKET) depth++;
+                                        else if (tokens[pos].type == TokenType::RBRACKET) {
+                                            depth--;
+                                            if (depth == 0) { pos++; break; }
+                                        }
+                                        if (!tokens[pos].value.empty()) arg_val += tokens[pos].value;
+                                        pos++;
+                                    }
+                                    arg_val += "]";
                                 }
                                 call_node.args.push_back(arg_val);
                             }
@@ -380,16 +450,12 @@ ASTNode parse_block(const vector<Token>& tokens, size_t& pos) {
                     block.body.push_back(call_node);
                 }
             }
-            else if (tokens[pos].type == TokenType::NEWLINE) {
-                pos++;
-            }
+            else if (tokens[pos].type == TokenType::NEWLINE) {pos++;}
             else {
                 pos++;
             }
         }
-        if (pos < tokens.size() && tokens[pos].type == TokenType::RBRACE) {
-            pos++;
-        }
+        if (pos < tokens.size() && tokens[pos].type == TokenType::RBRACE) {pos++;}
     }
     return block;
 }
@@ -433,15 +499,10 @@ ASTNode parse_dll_block(const vector<Token>& tokens, size_t& pos) {
         pos++;
 
         while (pos < tokens.size() && tokens[pos].type != TokenType::RBRACE) {
-            if (tokens[pos].type == TokenType::NEWLINE) {
-                pos++;
-                continue;
-            }
+            
+            if (tokens[pos].type == TokenType::NEWLINE) { pos++; continue;}
 
-            if (!tokens[pos].value.empty()) {
-                node.imports.push_back(tokens[pos].value);
-            }
-            pos++;
+            if (!tokens[pos].value.empty()) {node.imports.push_back(tokens[pos].value);} pos++;
         }
 
         if (pos < tokens.size() && tokens[pos].type == TokenType::RBRACE) {
@@ -458,35 +519,38 @@ ASTNode parse_function(const vector<Token>& tokens, size_t& pos) {
     pos++;
 
     if (pos < tokens.size() && tokens[pos].type == TokenType::IDENT) {
-        node.value = tokens[pos].value;
-        pos++;
+        node.value = tokens[pos].value; pos++;
     }
 
     if (pos < tokens.size() && tokens[pos].type == TokenType::LPAREN) {
         pos++;
         while (pos < tokens.size() && tokens[pos].type != TokenType::RPAREN) {
             if (tokens[pos].type == TokenType::COMMA) {
-                pos++;
-                continue;
-            }
-            if (tokens[pos].type == TokenType::ARGS) {
-                node.is_variadic = true;
-                pos++;
-                continue;
+                pos++; continue;
             }
             if (tokens[pos].type == TokenType::IDENT) {
-                string first = tokens[pos].value;
+                string ptype = tokens[pos].value;
                 pos++;
-                if (first == "*" && pos < tokens.size() && tokens[pos].type == TokenType::IDENT) {
-                    first += tokens[pos].value;
+                if (ptype == "*" && pos < tokens.size() && tokens[pos].type == TokenType::IDENT) {
+                    ptype += tokens[pos].value;
                     pos++;
                 }
+                if (pos < tokens.size() && tokens[pos].type == TokenType::LBRACKET) {
+                    pos++;
+                    if (pos < tokens.size() && tokens[pos].type == TokenType::RBRACKET) {
+                        ptype += "[]";
+                        pos++;
+                    }
+                }
+
                 if (pos < tokens.size() && tokens[pos].type == TokenType::IDENT) {
                     node.params.push_back(tokens[pos].value);
+                    node.param_types.push_back(ptype);
                     pos++;
                 }
                 else {
-                    node.params.push_back(first);
+                    node.params.push_back(ptype);
+                    node.param_types.push_back(ptype);
                 }
             }
             else {
@@ -512,14 +576,8 @@ ASTNode parse_function(const vector<Token>& tokens, size_t& pos) {
 
     if (pos < tokens.size() && tokens[pos].type == TokenType::LBRACE) {
         ASTNode body = parse_block(tokens, pos);
-
         for (const auto& stmt : body.body) {
-            if (stmt.type == NodeType::VARIADIC_BODY) {
-                node.variadic_body = stmt.body;
-            }
-            else {
-                node.body.push_back(stmt);
-            }
+            node.body.push_back(stmt);
         }
     }
     return node;
@@ -559,8 +617,7 @@ vector<ASTNode> parse(const vector<Token>& tokens) {
                 while (pos < tokens.size() && tokens[pos].type != TokenType::RBRACE) {
                     if (tokens[pos].type == TokenType::STRING) {
                         node.imports.push_back(tokens[pos].value);
-                    }
-                    pos++;
+                    } pos++;
                 }
                 if (pos < tokens.size() && tokens[pos].type == TokenType::RBRACE) {
                     pos++;

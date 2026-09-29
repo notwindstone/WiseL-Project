@@ -6,45 +6,108 @@
 using namespace std;
 
 // Type registry
-static bool is_int_type(const string& t) { return !t.empty() && (t[0] == 'i' || t[0] == 'u'); }
-static bool is_signed_type(const string& t) { return !t.empty() && t[0] == 'i'; }
-static bool is_unsigned_type(const string& t) { return !t.empty() && t[0] == 'u'; }
+struct TypeInfo {
+    const char* name;
+    int size;
+    bool is_signed;
+    const char* fasm_dir;
+    const char* load_op;
+};
+
+static const TypeInfo TYPE_TABLE[] = {
+    {"i8",   1,  true,  "db", "movsx"},
+    {"u8",   1,  false, "db", "movzx"},
+    {"i16",  2,  true,  "dw", "movsx"},
+    {"u16",  2,  false, "dw", "movzx"},
+    {"i32",  4,  true,  "dd", "movsxd"},
+    {"u32",  4,  false, "dd", "movzx"},
+    {"i64",  8,  true,  "dq", "mov"},
+    {"u64",  8,  false, "dq", "mov"},
+    {"i128", 16, true,  "dq", "mov"},
+    {"u128", 16, false, "dq", "mov"},
+};
+
+static const TypeInfo* lookup_type(const string& t) {
+    for (const auto& ti : TYPE_TABLE) {
+        if (t == ti.name) return &ti;
+    }
+    return nullptr;
+}
+
+static bool is_int_type(const string& t) { return lookup_type(t) != nullptr; }
+static bool is_signed_type(const string& t) { const TypeInfo* ti = lookup_type(t); return ti && ti->is_signed; }
+static bool is_unsigned_type(const string& t) { const TypeInfo* ti = lookup_type(t); return ti && !ti->is_signed; }
 static bool is_pointer_type(const string& t) { return t.size() >= 2 && t[0] == '*'; }
 static bool is_string_type(const string& t) { return t == "str" || t == "*u8" || t == "*i8" || t == "*char"; }
 static bool is_float_type(const string& t) { return t == "f32" || t == "f64"; }
 static bool is_char_type(const string& t) { return t == "char"; }
 
-// Counters & registries
-static int data_counter = 0;
-static string current_func_name;
-static map<string, string> func_return_types;
+struct Target {
+    const char* name;
+    bool is64;
+    int ptr;
+    const char* ax;
+    const char* cx;
+    const char* dx;
+    const char* si;
+    const char* di;
+    const char* sp;
+    const char* bp;
+    const char* ptr_kw;
+    const char* ptr_dir;
+    const char* fasm_format;
+    bool args_in_regs;
+    bool shadow_space;
+    bool callee_cleans;
+    bool align16;
+    vector<string> pool;
+    vector<string> arg_regs;
+};
+
+static Target WIN64 = {
+    "win64", true, 8, 
+    "rax", "rcx", "rdx", "rsi", "rdi", "rsp", "rbp", 
+    "qword", "dq", "PE64 Console", 
+    true, true, false, true, 
+    {"rbx", "r12", "r13", "r14", "r15", "rdi", "rsi", "rbp"}, 
+    {"rcx", "rdx", "r8", "r9"}, 
+};
+
+static Target TG = WIN64;
+
+static int data_counter = 0; 
+static string current_func_name; 
+static map<string, string> func_return_types; 
 static map<string, vector<string>> func_param_types;
 
-// Standard emit helpers
-static void emit(std::stringstream& ss, const std::string& instr) {
+static void emit(stringstream& ss, const string& instr) {
     ss << "    " << instr << "\n";
 }
 
-static void emit_label(std::stringstream& ss, const std::string& label) {
+static void emit_label(stringstream& ss, const string& label) {
     ss << label << ":\n";
 }
 
-static void emit_comment(std::stringstream& ss, const std::string& comment) {
+static void emit_comment(stringstream& ss, const string& comment) {
     ss << "    ; " << comment << "\n";
 }
 
-// Helper trim function
+static bool is_num_lit(const string& v) { return !v.empty() && (isdigit(v[0]) || (v.size() > 1 && v[0] == '-' && isdigit(v[1]))); }
+
 static string trim(string s) {
     size_t first = s.find_first_not_of(" \t\r\n");
     return (first == string::npos) ? "" : s.substr(first, s.find_last_not_of(" \t\r\n") - first + 1);
 }
 
-// Forward declaration
+// Forward declarations
 string resolve_var(const string& name, const map<string, string>& locals, 
                    const map<string, string>& params,
                    const map<string, string>& var_types);
+                   
+string type_to_fasm(const string& type);
+string get_arg_type(const string& arg, const map<string, string>& locals, const map<string, string>& params, const map<string, string>& var_types, const map<string, string>& local_types);
+string type_to_fasm(const string& type);
 
-// Escape string for FASM db directive
 string escape_for_fasm(const string& raw) {
     string result;
     for (size_t i = 0; i < raw.size(); i++) {
@@ -71,8 +134,15 @@ string escape_for_fasm(const string& raw) {
     return result;
 }
 
-// Generate inline assembly blocks
-void generate_asm_block(const ASTNode& node, std::stringstream& ss,
+static void emit_string_literal(const string& quoted, const string& dest, stringstream& ss, stringstream& extra_ss) {
+    string label = "str_arg_" + to_string(data_counter++);
+    string raw = quoted.substr(1, quoted.size() - 2);
+    emit(extra_ss, label + " db " + escape_for_fasm(raw) + ",0");
+    emit(extra_ss, label + "_len dd " + to_string(raw.size()));
+    emit(ss, "lea " + dest + ", [" + label + "]");
+}
+
+void generate_asm_block(const ASTNode& node, stringstream& ss,
                         const map<string, string>& locals,
                         const map<string, string>& params,
                         const map<string, string>& var_types) {
@@ -100,10 +170,10 @@ void generate_asm_block(const ASTNode& node, std::stringstream& ss,
     }
 }
 
-// Generate function call with arguments in rcx, rdx, r8, r9 (Windows x64 ABI)
-void generate_func_call(const ASTNode& stmt, std::stringstream& ss, std::stringstream& extra_ss, 
+void generate_func_call(const ASTNode& stmt, stringstream& ss, stringstream& extra_ss, 
                         const map<string, string>& var_types, 
                         const map<string, string>& locals, 
+                        const map<string, string>& local_types,
                         const map<string, string>& params,
                         const map<string, bool>& defined_functions) {
     if (stmt.args.empty()) {
@@ -115,17 +185,102 @@ void generate_func_call(const ASTNode& stmt, std::stringstream& ss, std::strings
         return;
     }
 
-    vector<string> arg_regs = {"rcx", "rdx", "r8", "r9"};
+    // NEW: Automatically construct any[] array on the stack at runtime
+    auto fpt = func_param_types.find(stmt.value);
+    if (fpt != func_param_types.end() && !fpt->second.empty() && fpt->second[0] == "any[]") {
+        int num_args = stmt.args.size();
+        int header_size = 8;
+        int ptr_table_size = num_args * 8;
+        int records_size = num_args * 16;
+        int total_size = header_size + ptr_table_size + records_size;
+        
+        // Align to 16 bytes
+        total_size = (total_size + 15) & ~15;
+        
+        emit(ss, "sub rsp, " + to_string(total_size));
+        emit(ss, "mov r10, rsp");
+        
+        // Store length in header
+        emit(ss, "mov qword [r10], " + to_string(num_args));
+        
+        int ptr_table_offset = header_size;
+        int records_offset = header_size + ptr_table_size;
+        
+        for (int i = 0; i < num_args; i++) {
+            const string& arg = stmt.args[i];
+            string arg_type = get_arg_type(arg, locals, params, var_types, local_types);
+            
+            int record_offset = records_offset + (i * 16);
+            int ptr_offset = ptr_table_offset + (i * 8);
+            
+            // Store pointer to the any record in the pointer table
+            emit(ss, "lea r11, [r10 + " + to_string(record_offset) + "]");
+            emit(ss, "mov [r10 + " + to_string(ptr_offset) + "], r11");
+            
+            if (arg_type == "str") {
+                emit(ss, "mov qword [r10 + " + to_string(record_offset) + "], 1"); // type 1 = string
+                
+                if (arg.size() >= 2 && arg.front() == '"') {
+                    string str_label = "str_any_" + to_string(data_counter++);
+                    string raw = arg.substr(1, arg.size() - 2);
+                    emit(extra_ss, str_label + " db " + escape_for_fasm(raw) + ",0");
+                    emit(ss, "lea r11, [" + str_label + "]");
+                    emit(ss, "mov [r10 + " + to_string(record_offset + 8) + "], r11");
+                } else {
+                    auto lit = locals.find(arg);
+                    auto pit = params.find(arg);
+                    if (lit != locals.end()) {
+                        emit(ss, "mov [r10 + " + to_string(record_offset + 8) + "], " + lit->second);
+                    } else if (pit != params.end()) {
+                        emit(ss, "mov r11, " + pit->second);
+                        emit(ss, "mov [r10 + " + to_string(record_offset + 8) + "], r11");
+                    } else {
+                        emit(ss, "lea r11, [" + arg + "]");
+                        emit(ss, "mov [r10 + " + to_string(record_offset + 8) + "], r11");
+                    }
+                }
+            } else {
+                emit(ss, "mov qword [r10 + " + to_string(record_offset) + "], 0"); // type 0 = int
+                
+                if (is_num_lit(arg)) {
+                    emit(ss, "mov qword [r10 + " + to_string(record_offset + 8) + "], " + arg);
+                } else {
+                    auto lit = locals.find(arg);
+                    auto pit = params.find(arg);
+                    if (lit != locals.end()) {
+                        emit(ss, "mov [r10 + " + to_string(record_offset + 8) + "], " + lit->second);
+                    } else if (pit != params.end()) {
+                        emit(ss, "mov r11, " + pit->second);
+                        emit(ss, "mov [r10 + " + to_string(record_offset + 8) + "], r11");
+                    } else {
+                        emit(ss, "mov r11, [" + arg + "]");
+                        emit(ss, "mov [r10 + " + to_string(record_offset + 8) + "], r11");
+                    }
+                }
+            }
+        }
+        
+        // rcx gets the pointer to the start of the pointer table (which acts as the array data)
+        emit(ss, "lea rcx, [r10 + " + to_string(header_size) + "]");
+        if (defined_functions.find(stmt.value) != defined_functions.end()) {
+            emit(ss, "call func_" + stmt.value);
+        } else {
+            emit(ss, "call [" + stmt.value + "]");
+        }
+        
+        // Clean up stack
+        emit(ss, "add rsp, " + to_string(total_size));
+        return;
+    }
 
-    for (size_t i = 0; i < stmt.args.size() && i < 4; i++) {
+    vector<string> arg_regs = TG.arg_regs;
+
+    for (size_t i = 0; i < stmt.args.size() && i < arg_regs.size(); i++) {
         const string& arg = stmt.args[i];
         string reg = arg_regs[i];
 
         if (arg.size() >= 2 && arg.front() == '"') {
-            string label = "str_arg_" + to_string(data_counter++);
-            string raw_arg = arg.substr(1, arg.size() - 2);
-            emit(extra_ss, label + " db " + escape_for_fasm(raw_arg) + ",0");
-            emit(ss, "lea " + reg + ", [" + label + "]");
+            emit_string_literal(arg, reg, ss, extra_ss);
         }
         else if (!arg.empty() && (isdigit(arg[0]) || (arg.size() > 1 && arg[0] == '-' && isdigit(arg[1])))) {
             emit(ss, "mov " + reg + ", " + arg);
@@ -160,9 +315,91 @@ void generate_func_call(const ASTNode& stmt, std::stringstream& ss, std::strings
                     emit(ss, "mov " + reg + ", " + pit->second);
                 } else if (tit != var_types.end() && (is_string_type(tit->second) || tit->second == "i8" || tit->second == "u8")) {
                     emit(ss, "lea " + reg + ", [" + arg + "]");
+                } else if (arg.size() >= 2 && arg.front() == '[' && arg.back() == ']') {
+                    string content = arg.substr(1, arg.size() - 2);
+                    vector<string> elements;
+                    string current_elem;
+                    int quote_count = 0;
+                    for (size_t ci = 0; ci < content.size(); ci++) {
+                        char c = content[ci];
+                        if (c == '"') {
+                            quote_count++;
+                            current_elem += c;
+                            if (quote_count == 2) {
+                                elements.push_back(trim(current_elem));
+                                current_elem.clear();
+                                quote_count = 0;
+                                if (ci + 1 < content.size() && content[ci+1] == ',') ci++;
+                            }
+                        } else if (quote_count == 0 && c == ',') {
+                            continue;
+                        } else {
+                            current_elem += c;
+                        }
+                    }
+                    if (!current_elem.empty() && quote_count == 0) elements.push_back(trim(current_elem));
+                    
+                    string arr_label = "arr_arg_" + to_string(data_counter++);
+                    emit(extra_ss, arr_label + "_header:");
+                    emit(extra_ss, "    dq " + to_string(elements.size()));
+                    emit(extra_ss, arr_label + "_data:");
+
+                    emit(extra_ss, "    dq " + arr_label + "_item_0");
+                    for (size_t ei = 1; ei < elements.size(); ei++) {
+                        emit(extra_ss, "    dq " + arr_label + "_item_" + to_string(ei));
+                    }
+
+                    for (size_t ei = 0; ei < elements.size(); ei++) {
+                        string elem = elements[ei];
+                        if (elem.size() >= 2 && elem[0] == '"' && elem.back() == '"') {
+                            string raw = elem.substr(1, elem.size() - 2);
+                            emit(extra_ss, arr_label + "_item_" + to_string(ei) + " db " + escape_for_fasm(raw) + ",0");
+                        }
+                    }
+                    
+                    emit(ss, "lea " + reg + ", [" + arr_label + "_data]");
                 } else if (arg.find('[') != string::npos) {
-                    string resolved = resolve_var(arg, locals, params, var_types);
-                    emit(ss, "movzx " + reg + ", " + resolved);
+                    size_t br = arg.find('[');
+                    string base = arg.substr(0, br);
+                    size_t cl = arg.find(']');
+                    string index = arg.substr(br + 1, cl - br - 1);
+                    
+                    auto vit_arr = var_types.find(base);
+                    auto lit_arr = locals.find(base);
+                    auto ltit_arr = local_types.find(base);
+                    auto pit_arr = params.find(base);
+                    bool is_array = false;
+                    string elem_type;
+                    
+                    if (vit_arr != var_types.end() && vit_arr->second.size() >= 2 && vit_arr->second.substr(vit_arr->second.size()-2) == "[]") {
+                        is_array = true;
+                        elem_type = vit_arr->second.substr(0, vit_arr->second.size() - 2);
+                    }
+                    if (!is_array && ltit_arr != local_types.end() && ltit_arr->second.size() >= 2 && ltit_arr->second.substr(ltit_arr->second.size()-2) == "[]") {
+                        is_array = true;
+                        elem_type = ltit_arr->second.substr(0, ltit_arr->second.size() - 2);
+                    }
+                    if (!is_array && pit_arr != params.end()) {
+                        is_array = true;
+                        elem_type = "str"; 
+                    }
+                    
+                    if (is_array && (is_string_type(elem_type) || elem_type == "any")) {
+                        string base_resolved = resolve_var(base, locals, params, var_types);
+                        emit(ss, "mov rdx, " + base_resolved);
+                        
+                        if (is_num_lit(index)) {
+                            emit(ss, "mov " + reg + ", [rdx + " + index + " * 8]");
+                        } else {
+                            string idx_resolved = resolve_var(index, locals, params, var_types);
+                            emit(ss, "mov rax, " + idx_resolved);
+                            emit(ss, "imul rax, 8");
+                            emit(ss, "mov " + reg + ", [rdx + rax]");
+                        }
+                    } else {
+                        string resolved = resolve_var(arg, locals, params, var_types);
+                        emit(ss, "movzx " + reg + ", " + resolved);
+                    }
                 } else {
                     emit(ss, "mov " + reg + ", [" + arg + "]");
                 }
@@ -209,7 +446,6 @@ void generate_func_call(const ASTNode& stmt, std::stringstream& ss, std::strings
     }
 }
 
-// Resolving the variables
 string resolve_var(const string& name, const map<string, string>& locals, 
                    const map<string, string>& params,
                    const map<string, string>& var_types) {
@@ -228,7 +464,7 @@ string resolve_var(const string& name, const map<string, string>& locals,
         else if (idx_pit != params.end()) idx_resolved = idx_pit->second;
         else idx_resolved = index;
         
-        return "byte [" + base + " + " + idx_resolved + "]";
+        return "byte [" + base_resolved + " + " + idx_resolved + "]";
     }
     auto lit = locals.find(name);
     if (lit != locals.end()) return lit->second;
@@ -247,13 +483,12 @@ string resolve_var(const string& name, const map<string, string>& locals,
     return name;
 }
 
-// Generate comparison and jump for if/while conditions
-static void emit_condition(const string& cond, std::stringstream& ss,
+static void emit_condition(const string& cond, stringstream& ss,
                            const map<string, string>& locals,
                            const map<string, string>& params,
                            const map<string, string>& var_types,
                            const string& jump_if_false_label,
-                           std::stringstream& extra_ss,
+                           stringstream& extra_ss,
                            const map<string, string>& local_types) {
     if (cond == "true") return;
     size_t pos;
@@ -279,19 +514,50 @@ static void emit_condition(const string& cond, std::stringstream& ss,
                 string base_reg = resolve_var(base, locals, params, var_types);
                 string idx_reg = resolve_var(index, locals, params, var_types);
 
+                if (base_reg.find('[') != string::npos) {
+                    emit(ss, "mov rdx, " + base_reg);
+                    base_reg = "rdx";
+                }
+                if (idx_reg.find('[') != string::npos) {
+                    emit(ss, "mov rcx, " + idx_reg);
+                    idx_reg = "rcx";
+                }
+
                 if (right.size() == 3 && right[0] == '\'' && right[2] == '\'') {
                     int char_val = (unsigned char)right[1];
                     emit(ss, "cmp byte [" + base_reg + " + " + idx_reg + "], " + to_string(char_val));
                 } else {
                     emit(ss, "cmp byte [" + base_reg + " + " + idx_reg + "], " + right);
                 }
+                emit(ss, op.second + " " + jump_if_false_label);
+                return;
             }
             else if ((op.first == "==" || op.first == "!=") && right.size() >= 2 && right[0] == '"') {
-                string label = "cmp_str_" + to_string(data_counter++);
-                string cmp_label = "cmp_" + to_string(data_counter++);
-                string raw = right.substr(1, right.size() - 2);
+                string raw_str = right.substr(1, right.size() - 2);
                 
-                emit(extra_ss, label + " db " + escape_for_fasm(raw) + ",0");
+                if (raw_str.length() == 1) {
+                    int char_val = (unsigned char)raw_str[0];
+                    string left_reg = resolve_var(left, locals, params, var_types);
+                    
+                    bool is_ptr = false;
+                    auto vit = var_types.find(left);
+                    if (vit != var_types.end() && (is_pointer_type(vit->second) || is_string_type(vit->second))) is_ptr = true;
+                    auto lit = local_types.find(left);
+                    if (lit != local_types.end() && (is_pointer_type(lit->second) || is_string_type(lit->second))) is_ptr = true;
+
+                    if (is_ptr) {
+                        emit(ss, "cmp byte [" + left_reg + "], " + to_string(char_val));
+                    } else {
+                        emit(ss, "cmp " + left_reg + ", " + to_string(char_val));
+                    }
+                    emit(ss, op.second + " " + jump_if_false_label);
+                    return;
+                }
+                
+                string label = "cmp_str_" + to_string(data_counter++);
+                string cmp_label = "str_cmp_block_" + to_string(data_counter++);
+                
+                emit(extra_ss, label + " db " + escape_for_fasm(raw_str) + ",0");
                 
                 string left_reg = resolve_var(left, locals, params, var_types);
                 emit_comment(ss, "String comparison");
@@ -307,6 +573,7 @@ static void emit_condition(const string& cond, std::stringstream& ss,
                 emit(ss, "inc rsi");
                 emit(ss, "inc rdi");
                 emit(ss, "jmp ." + cmp_label + "_loop");
+                
                 emit_label(ss, "." + cmp_label + "_diff");
                 if (op.first == "==") {
                     emit(ss, "jmp " + jump_if_false_label);
@@ -314,6 +581,7 @@ static void emit_condition(const string& cond, std::stringstream& ss,
                     emit_comment(ss, "strings different, != is true, continue");
                 }
                 emit(ss, "jmp ." + cmp_label + "_end");
+                
                 emit_label(ss, "." + cmp_label + "_equal");
                 if (op.first == "!=") {
                     emit(ss, "jmp " + jump_if_false_label);
@@ -347,7 +615,8 @@ static void emit_condition(const string& cond, std::stringstream& ss,
             }
             else {
                 string left_reg = resolve_var(left, locals, params, var_types);
-                emit(ss, "cmp " + left_reg + ", " + right);
+                string right_val = is_num_lit(right) ? right : resolve_var(right, locals, params, var_types);
+                emit(ss, "cmp " + left_reg + ", " + right_val);
                 emit(ss, op.second + " " + jump_if_false_label);
                 return;
             }
@@ -355,10 +624,9 @@ static void emit_condition(const string& cond, std::stringstream& ss,
     }
 }
 
-// Determine argument type for variadic function dispatch
 string get_arg_type(const string& arg, const map<string, string>& locals, const map<string, string>& params, const map<string, string>& var_types, const map<string, string>& local_types) {
     if (arg.size() >= 2 && arg[0] == '"') return "str";
-    if (!arg.empty() && (isdigit(arg[0]) || (arg.size() > 1 && arg[0] == '-'))) return "int";
+    if (is_num_lit(arg)) return "int";
 
     auto vit = var_types.find(arg);
     if (vit != var_types.end() && is_string_type(vit->second)) return "str";
@@ -369,7 +637,6 @@ string get_arg_type(const string& arg, const map<string, string>& locals, const 
     return "int";
 }
 
-// Count local variables for register allocation
 static int count_locals(const vector<ASTNode>& stmts) {
     int count = 0;
     for (const auto& stmt : stmts) {
@@ -384,85 +651,22 @@ static int count_locals(const vector<ASTNode>& stmts) {
     return count;
 }
 
-// Check if block contains function calls for stack frame allocation
-static bool has_func_calls(const vector<ASTNode>& stmts) {
+static bool needs_frame(const vector<ASTNode>& stmts) {
     for (const auto& stmt : stmts) {
         if (stmt.type == NodeType::FUNC_CALL) return true;
-        if (stmt.type == NodeType::WHILE_STMT || stmt.type == NodeType::IF_STMT) {
-            if (has_func_calls(stmt.body)) return true;
-            if (has_func_calls(stmt.else_body)) return true;
-        }   
-    }
-    return false;
-}
-
-// Check if any inline assembly block contains a 'call' or 'invoke' instruction
-static bool has_asm_calls(const vector<ASTNode>& stmts) {
-    for (const auto& stmt : stmts) {
+        if (stmt.type == NodeType::LET_STMT && !stmt.var_value.empty() && stmt.var_value.find("(") != string::npos) return true;
         if (stmt.type == NodeType::ASM_BLOCK) {
             bool has_sub_rsp = false;
-            for (const auto& line : stmt.asm_lines) {
-                if (line.find("sub rsp") != string::npos) has_sub_rsp = true;
-            }
-            if (has_sub_rsp) continue;
-            for (const auto& line : stmt.asm_lines) {
-                if (line.find("call") != string::npos || line.find("invoke") != string::npos) {
-                    return true;
-                }
-            }
+            for (const auto& line : stmt.asm_lines) if (line.find("sub rsp") != string::npos) has_sub_rsp = true;
+            if (!has_sub_rsp) for (const auto& line : stmt.asm_lines) if (line.find("call") != string::npos || line.find("invoke") != string::npos) return true;
         }
-        else if (stmt.type == NodeType::LET_STMT) {
-            if (!stmt.var_value.empty() && stmt.var_value.find("(") != string::npos) {
-                return true;
-            }
-        }
-        else if (stmt.type == NodeType::WHILE_STMT || stmt.type == NodeType::IF_STMT) {
-            if (has_asm_calls(stmt.body) || has_asm_calls(stmt.else_body)) {
-                return true;
-            }
+        if (stmt.type == NodeType::WHILE_STMT || stmt.type == NodeType::IF_STMT) {
+            if (needs_frame(stmt.body) || needs_frame(stmt.else_body)) return true;
         }
     }
     return false;
 }
 
-// Generate code for variadic function arguments (println, etc)
-void generate_variadic_call(const ASTNode& stmt, const ASTNode& func_def,
-                            std::stringstream& ss, std::stringstream& extra_ss,
-                            const map<string, string>& var_types,
-                            const map<string, string>& locals,
-                            const map<string, string>& local_types,
-                            const map<string, string>& params,
-                            const map<string, bool>& defined_functions) {
-    for (const auto& arg : stmt.args) {
-        string arg_type = get_arg_type(arg, locals, params, var_types, local_types);
-
-        for (const auto& var_stmt : func_def.variadic_body) {
-            if (var_stmt.type == NodeType::IF_STMT) {
-                string cond = var_stmt.condition;
-                bool match = false;
-
-                if (cond.find("str") != string::npos && arg_type == "str") match = true;
-                if (cond.find("int") != string::npos && (arg_type == "i32" || arg_type == "i64" || arg_type == "int")) match = true;
-
-                if (match) {
-                    for (const auto& body_stmt : var_stmt.body) {
-                        if (body_stmt.type == NodeType::FUNC_CALL) {
-                            ASTNode new_call = body_stmt;
-                            for (size_t j = 0; j < new_call.args.size(); j++) {
-                                if (new_call.args[j].find("args[") != string::npos) {
-                                    new_call.args[j] = arg;
-                                }
-                            }
-                            generate_func_call(new_call, ss, extra_ss, var_types, locals, params, defined_functions);
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-// Validate type compatibility
 static void validate_type(const string& var_name, const string& var_type, 
                           const string& value, const map<string, string>& func_return_types_map) {
     if (value.size() >= 2 && value[0] == '"' && value.back() == '"') {
@@ -473,7 +677,7 @@ static void validate_type(const string& var_name, const string& var_type,
         }
     }
     
-    if (!value.empty() && (isdigit(value[0]) || (value.size() > 1 && value[0] == '-' && isdigit(value[1])))) {
+    if (is_num_lit(value)) {
         if (is_string_type(var_type)) {
             cerr << "[ERROR] Cannot assign number to string type '" << var_type 
                  << "' for variable '" << var_name << "'" << endl;
@@ -499,15 +703,217 @@ static void validate_type(const string& var_name, const string& var_type,
     }
 }
 
-// Generate code for block statements
-void generate_block(const vector<ASTNode>& stmts, std::stringstream& ss, std::stringstream& extra_ss, 
+// Added local_types to signature so INDEX_EXPR knows about parameter array types
+static void emit_expr(const shared_ptr<ASTNode>& e, const string& dest,
+                      stringstream& ss,
+                      const map<string, string>& locals,
+                      const map<string, string>& params,
+                      const map<string, string>& var_types,
+                      const map<string, string>& local_types) {
+    if (!e) return;
+
+    if (e->type == NodeType::LITERAL) {
+        if (e->value == "0") emit(ss, "xor " + dest + ", " + dest);
+        else emit(ss, "mov " + dest + ", " + e->value);
+        return;
+    }
+
+    if (e->type == NodeType::IDENT_REF) {
+        auto lit = locals.find(e->value);
+        if (lit != locals.end()) { if (dest != lit->second) emit(ss, "mov " + dest + ", " + lit->second); return; }
+        auto pit = params.find(e->value);
+        if (pit != params.end()) { emit(ss, "mov " + dest + ", " + pit->second); return; }
+        auto vit = var_types.find(e->value);
+        if (vit != var_types.end() && is_string_type(vit->second)) {
+            emit(ss, "lea " + dest + ", [" + e->value + "]");
+            return;
+        }
+        emit(ss, "mov " + dest + ", " + resolve_var(e->value, locals, params, var_types));
+        return;
+    }
+
+    if (e->type == NodeType::INDEX_EXPR) {
+        emit_expr(e->right, "rax", ss, locals, params, var_types, local_types);
+        
+        string base_name = e->left->value;
+        auto lit = locals.find(base_name);
+        auto pit = params.find(base_name);
+        auto vit = var_types.find(base_name);
+        auto ltit = local_types.find(base_name);
+        
+        bool is_array = false;
+        string elem_type = "";
+        
+        if (vit != var_types.end() && vit->second.size() >= 2 && vit->second.substr(vit->second.size()-2) == "[]") {
+            is_array = true;
+            elem_type = vit->second.substr(0, vit->second.size() - 2);
+        }
+        else if (ltit != local_types.end() && ltit->second.size() >= 2 && ltit->second.substr(ltit->second.size()-2) == "[]") {
+            is_array = true;
+            elem_type = ltit->second.substr(0, ltit->second.size() - 2);
+        }
+        
+        if (is_array) {
+            if (is_string_type(elem_type) || elem_type == "any") {
+                if (lit != locals.end()) {
+                    emit(ss, "mov rdx, " + lit->second);
+                    emit(ss, "imul rax, 8");
+                    emit(ss, "mov " + dest + ", [rdx + rax]");
+                } else if (pit != params.end()) {
+                    emit(ss, "mov rdx, " + pit->second);
+                    emit(ss, "imul rax, 8");
+                    emit(ss, "mov " + dest + ", [rdx + rax]");
+                } else {
+                    emit(ss, "imul rax, 8");
+                    emit(ss, "mov " + dest + ", [" + base_name + " + rax]");
+                }
+            } else {
+                int elem_size = 4;
+                if (elem_type == "i8" || elem_type == "u8") elem_size = 1;
+                else if (elem_type == "i16" || elem_type == "u16") elem_size = 2;
+                else if (elem_type == "i64" || elem_type == "u64") elem_size = 8;
+                
+                if (lit != locals.end()) {
+                    emit(ss, "imul rax, " + to_string(elem_size));
+                    emit(ss, "mov " + dest + ", [" + lit->second + " + rax]");
+                } else if (pit != params.end()) {
+                    emit(ss, "imul rax, " + to_string(elem_size));
+                    emit(ss, "mov " + dest + ", [" + pit->second + " + rax]");
+                } else {
+                    emit(ss, "imul rax, " + to_string(elem_size));
+                    emit(ss, "mov " + dest + ", [" + base_name + " + rax]");
+                }
+            }
+        } else {
+            if (lit != locals.end()) {
+                emit(ss, "movzx " + dest + ", byte [" + lit->second + " + rax]");
+            } else if (pit != params.end()) {
+                emit(ss, "mov rdx, " + pit->second);
+                emit(ss, "movzx " + dest + ", byte [rdx + rax]");
+            } else {
+                emit(ss, "movzx " + dest + ", byte [" + base_name + " + rax]");
+            }
+        }
+        return;
+    }
+
+    if (e->type == NodeType::BINARY_OP) {
+        if (e->op == "u-") {
+            emit_expr(e->right, dest, ss, locals, params, var_types, local_types);
+            emit(ss, "neg " + dest);
+            return;
+        }
+
+        if (e->left && e->right && 
+            e->left->type == NodeType::LITERAL && 
+            e->right->type == NodeType::LITERAL) {
+            long long lv = atoll(e->left->value.c_str());
+            long long rv = atoll(e->right->value.c_str());
+            long long result = 0;
+            if (e->op == "+") result = lv + rv;
+            else if (e->op == "-") result = lv - rv;
+            else if (e->op == "*") result = lv * rv;
+            else if (e->op == "/" && rv != 0) result = lv / rv;
+            else if (e->op == "%" && rv != 0) result = lv % rv;
+            else goto no_fold;
+            
+            if (result == 0) emit(ss, "xor " + dest + ", " + dest);
+            else emit(ss, "mov " + dest + ", " + to_string(result));
+            return;
+        }
+        no_fold:
+
+        if (e->op == "+" && e->right && e->right->type == NodeType::LITERAL && e->right->value == "0") {
+            emit_expr(e->left, dest, ss, locals, params, var_types, local_types);
+            return;
+        }
+        if (e->op == "-" && e->right && e->right->type == NodeType::LITERAL && e->right->value == "0") {
+            emit_expr(e->left, dest, ss, locals, params, var_types, local_types);
+            return;
+        }
+        if (e->op == "*" && e->right && e->right->type == NodeType::LITERAL && e->right->value == "1") {
+            emit_expr(e->left, dest, ss, locals, params, var_types, local_types);
+            return;
+        }
+        
+        if (e->op == "-" && e->left && e->left->type == NodeType::LITERAL && e->left->value == "0") {
+            emit_expr(e->right, dest, ss, locals, params, var_types, local_types);
+            emit(ss, "neg " + dest);
+            return;
+        }
+
+        string right_op;
+        bool right_simple = false;
+        if (e->right->type == NodeType::LITERAL) { right_op = e->right->value; right_simple = true; }
+        else if (e->right->type == NodeType::IDENT_REF) {
+            auto rl = locals.find(e->right->value);
+            if (rl != locals.end()) { right_op = rl->second; right_simple = true; }
+            else {
+                auto rp = params.find(e->right->value);
+                if (rp != params.end()) { right_op = rp->second; right_simple = true; }
+            }
+        }
+
+        if (right_simple && (e->op == "+" || e->op == "-" || e->op == "*")) {
+            emit_expr(e->left, dest, ss, locals, params, var_types, local_types);
+            if (e->op == "+") emit(ss, "add " + dest + ", " + right_op);
+            else if (e->op == "-") emit(ss, "sub " + dest + ", " + right_op);
+            else emit(ss, "imul " + dest + ", " + right_op);
+            return;
+        }
+
+        if (right_simple && (e->op == "/" || e->op == "%")) {
+            emit(ss, "mov r10, " + right_op);
+            emit_expr(e->left, "rax", ss, locals, params, var_types, local_types);
+            emit(ss, "xor rdx, rdx");
+            emit(ss, "div r10");
+            if (e->op == "%") { if (dest != "rdx") emit(ss, "mov " + dest + ", rdx"); }
+            else if (dest != "rax") emit(ss, "mov " + dest + ", rax");
+            return;
+        }
+
+        if (dest != "rax") {
+            if (e->op == "/" || e->op == "%") {
+                emit_expr(e->right, "rax", ss, locals, params, var_types, local_types);
+                emit(ss, "mov r10, rax");
+                emit_expr(e->left, "rax", ss, locals, params, var_types, local_types);
+                emit(ss, "xor rdx, rdx");
+                emit(ss, "div r10");
+                emit(ss, "mov " + dest + ", " + (e->op == "%" ? "rdx" : "rax"));
+            } else {
+                emit_expr(e->left, dest, ss, locals, params, var_types, local_types);
+                emit_expr(e->right, "rax", ss, locals, params, var_types, local_types);
+                if (e->op == "+") emit(ss, "add " + dest + ", rax");
+                else if (e->op == "-") emit(ss, "sub " + dest + ", rax");
+                else emit(ss, "imul " + dest + ", rax");
+            }
+            return;
+        }
+
+        emit_expr(e->left, "rax", ss, locals, params, var_types, local_types);
+        emit(ss, "push rax");
+        emit_expr(e->right, "rax", ss, locals, params, var_types, local_types);
+        emit(ss, "mov rcx, rax");
+        emit(ss, "pop rax");
+
+        if (e->op == "+") emit(ss, "add rax, rcx");
+        else if (e->op == "-") emit(ss, "sub rax, rcx");
+        else if (e->op == "*") emit(ss, "imul rax, rcx");
+        else if (e->op == "/") { emit(ss, "xor rdx, rdx"); emit(ss, "div rcx"); }
+        else if (e->op == "%") { emit(ss, "xor rdx, rdx"); emit(ss, "div rcx"); emit(ss, "mov rax, rdx"); }
+
+        if (dest != "rax") emit(ss, "mov " + dest + ", rax");
+        return;
+    }
+}
+
+void generate_block(const vector<ASTNode>& stmts, stringstream& ss, stringstream& extra_ss, 
                     const map<string, string>& var_types,
                     const map<string, string>& params,
                     map<string, string>& locals,
                     map<string, string>& local_types,
                     vector<string>& local_regs, int& local_index,
                     const string& loop_end_label,
-                    const map<string, ASTNode>& variadic_funcs,
                     const map<string, bool>& defined_functions) {
     
     for (const auto& stmt : stmts) {
@@ -538,42 +944,22 @@ void generate_block(const vector<ASTNode>& stmts, std::stringstream& ss, std::st
                     local_types[stmt.var_name] = stmt.var_type;
                 }
 
-                // 1. String literal
                 if ((is_string_type(stmt.var_type) || is_pointer_type(stmt.var_type)) && 
                     stmt.var_value.size() >= 2 && stmt.var_value[0] == '"') {
-                    string label = "str_arg_" + to_string(data_counter++);
-                    string clean = stmt.var_value.substr(1, stmt.var_value.size() - 2);
-                    emit(extra_ss, label + " db " + escape_for_fasm(clean) + ",0");
-                    emit(ss, "lea " + reg + ", [" + label + "]");
+                    emit_string_literal(stmt.var_value, reg, ss, extra_ss);
                 }
-                // 2. Binary arithmetic expression (+, -, *, /, %)
-                else if (stmt.expr && stmt.expr->type == NodeType::BINARY_OP) {
-                    string left_reg  = resolve_var(stmt.expr->left->value, locals, params, var_types);
-                    string right_val = resolve_var(stmt.expr->right->value, locals, params, var_types);
-                    string op = stmt.expr->op;
-
-                    if (op == "+" || op == "-" || op == "*") {
-                        string asm_op = (op == "+") ? "add" : (op == "-") ? "sub" : "imul";
-                        emit(ss, "mov " + reg + ", " + left_reg);
-                        emit(ss, asm_op + " " + reg + ", " + right_val);
-                    } 
-                    else if (op == "/" || op == "%") {
-                        emit(ss, "mov rax, " + left_reg);
-                        emit(ss, "xor rdx, rdx");
-                        if (!right_val.empty() && isdigit(right_val[0])) {
-                            emit(ss, "mov r10, " + right_val);
-                            emit(ss, "div r10");
-                        } else {
-                            emit(ss, "div " + right_val);
-                        }
-                        emit(ss, "mov " + reg + ", " + (op == "%" ? "rdx" : "rax"));
+                else if (stmt.expr) {
+                    if ((is_pointer_type(stmt.var_type) || is_string_type(stmt.var_type)) &&
+                        stmt.expr->type == NodeType::IDENT_REF &&
+                        var_types.find(stmt.expr->value) != var_types.end()) {
+                        emit(ss, "lea " + reg + ", [" + stmt.expr->value + "]");
+                    } else {
+                        emit_expr(stmt.expr, reg, ss, locals, params, var_types, local_types);
                     }
                 }
-                // 3. Uninitialized variable (zero initialization)
                 else if (stmt.var_value.empty()) {
                     emit(ss, "xor " + reg + ", " + reg);
                 }
-                // 4. Function call result assignment
                 else if (stmt.var_value.find("(") != string::npos && stmt.var_value.find(")") != string::npos) {
                     string func_name = trim(stmt.var_value.substr(0, stmt.var_value.find("(")));
 
@@ -599,18 +985,15 @@ void generate_block(const vector<ASTNode>& stmts, std::stringstream& ss, std::st
                     string trimmed = trim(current);
                     if (!trimmed.empty()) call_args.push_back(trimmed);
 
-                    vector<string> arg_regs = {"rcx", "rdx", "r8", "r9"};
-                    for (size_t i = 0; i < call_args.size() && i < 4; i++) {
+                    vector<string> arg_regs = TG.arg_regs;
+                    for (size_t i = 0; i < call_args.size() && i < arg_regs.size(); i++) {
                         const string& arg = call_args[i];
                         string arg_reg = arg_regs[i];
 
                         if (arg.size() >= 2 && arg.front() == '"') {
-                            string label = "str_arg_" + to_string(data_counter++);
-                            string raw_arg = arg.substr(1, arg.size() - 2);
-                            emit(extra_ss, label + " db " + escape_for_fasm(raw_arg) + ",0");
-                            emit(ss, "lea " + arg_reg + ", [" + label + "]");
+                            emit_string_literal(arg, arg_reg, ss, extra_ss);
                         }
-                        else if (!arg.empty() && (isdigit(arg[0]) || (arg.size() > 1 && arg[0] == '-' && isdigit(arg[1])))) {
+                        else if (is_num_lit(arg)) {
                             emit(ss, "mov " + arg_reg + ", " + arg);
                         }
                         else {
@@ -649,12 +1032,68 @@ void generate_block(const vector<ASTNode>& stmts, std::stringstream& ss, std::st
 
                     emit(ss, "mov " + reg + ", rax");
                 }
-                // 5. Numeric constant
-                else if (!stmt.var_value.empty() && (isdigit(stmt.var_value[0]) || (stmt.var_value.size() > 1 && stmt.var_value[0] == '-'))) {
+                else if (is_num_lit(stmt.var_value)) {
                     if (stmt.var_value == "0") emit(ss, "xor " + reg + ", " + reg);
                     else emit(ss, "mov " + reg + ", " + stmt.var_value);
                 }
-                // 6. Copy from another variable
+                else if (stmt.var_value.size() >= 2 && stmt.var_value.front() == '[' && stmt.var_value.back() == ']') {
+                    string content = stmt.var_value.substr(1, stmt.var_value.size() - 2);
+                    
+                    vector<string> elements;
+                    string current_elem;
+                    int depth = 0;
+                    for (size_t i = 0; i < content.size(); i++) {
+                        char c = content[i];
+                        if (c == '"' && (current_elem.empty() || current_elem.back() != '\\')) {
+                            current_elem += c;
+                            int quote_count = 0;
+                            for (char ch : current_elem) if (ch == '"') quote_count++;
+                            if (quote_count == 2 && (i + 1 >= content.size() || content[i+1] == ',')) {
+                                elements.push_back(trim(current_elem));
+                                current_elem.clear();
+                                if (i + 1 < content.size() && content[i+1] == ',') i++;
+                            }
+                        } else if (c == ',' && depth == 0 && current_elem.find('"') == string::npos) {
+                            if (!current_elem.empty()) {
+                                elements.push_back(trim(current_elem));
+                                current_elem.clear();
+                            }
+                        } else {
+                            current_elem += c;
+                        }
+                    }
+                    if (!current_elem.empty()) elements.push_back(trim(current_elem));
+                    
+                    string arr_label = "arr_arg_" + to_string(data_counter++);
+                    string elem_type = stmt.var_type.substr(0, stmt.var_type.size() - 2); 
+                    
+                    emit(extra_ss, arr_label + "_header:");
+                    emit(extra_ss, "    dq " + to_string(elements.size()));
+                    emit(extra_ss, arr_label + "_data:");
+                    
+                    if (is_string_type(elem_type)) {
+                        emit(extra_ss, "    dq " + arr_label + "_item_0");
+                        for (size_t i = 1; i < elements.size(); i++) {
+                            emit(extra_ss, "    dq " + arr_label + "_item_" + to_string(i));
+                        }
+                        for (size_t i = 0; i < elements.size(); i++) {
+                            string elem = elements[i];
+                            if (elem.size() >= 2 && elem[0] == '"' && elem.back() == '"') {
+                                string raw = elem.substr(1, elem.size() - 2);
+                                emit(extra_ss, arr_label + "_item_" + to_string(i) + " db " + escape_for_fasm(raw) + ",0");
+                            }
+                        }
+                    } else {
+                        string values;
+                        for (size_t i = 0; i < elements.size(); i++) {
+                            if (i > 0) values += ",";
+                            values += elements[i];
+                        }
+                        emit(extra_ss, "    " + type_to_fasm(elem_type) + " " + values);
+                    }
+                    
+                    emit(ss, "lea " + reg + ", [" + arr_label + "_data]");
+                }
                 else {
                     if (is_pointer_type(stmt.var_type) || is_string_type(stmt.var_type)) {
                         auto vit = var_types.find(stmt.var_value);
@@ -666,16 +1105,80 @@ void generate_block(const vector<ASTNode>& stmts, std::stringstream& ss, std::st
                         }
                     }
                     else {
-                        string resolved = resolve_var(stmt.var_value, locals, params, var_types);
                         auto vit = var_types.find(stmt.var_value);
-                        if (vit != var_types.end()) {
-                            string type = vit->second;
-                            if (type == "i32" || type == "u32") emit(ss, "mov " + reg + ", dword [" + stmt.var_value + "]");
-                            else if (type == "i16" || type == "u16") emit(ss, "mov " + reg + ", word [" + stmt.var_value + "]");
-                            else if (type == "i8" || type == "u8" || type == "char") emit(ss, "mov " + reg + ", byte [" + stmt.var_value + "]");
-                            else emit(ss, "mov " + reg + ", qword [" + stmt.var_value + "]");
+                        if (vit != var_types.end() && is_string_type(vit->second)) emit(ss, "mov " + reg + ", qword [" + stmt.var_value + "]");
+                        else emit(ss, "mov " + reg + ", " + resolve_var(stmt.var_value, locals, params, var_types));
+                    }
+                }
+                break;
+            }
+
+            case NodeType::ASSIGN_STMT: {
+                string target = stmt.var_name;
+                size_t br = target.find('[');
+
+                if (br != string::npos) {
+                    size_t cl = target.find(']');
+                    string base = target.substr(0, br);
+                    string index = target.substr(br + 1, cl - br - 1);
+
+                    string idx_reg = resolve_var(index, locals, params, var_types);
+                    if (idx_reg.find('[') != string::npos) {
+                        emit(ss, "mov rcx, " + idx_reg);
+                        idx_reg = "rcx";
+                    }
+
+                    string base_reg;
+                    auto blit = locals.find(base);
+                    if (blit != locals.end()) {
+                        base_reg = blit->second;
+                    } else {
+                        auto bpit = params.find(base);
+                        if (bpit != params.end()) {
+                            emit(ss, "mov rdx, " + bpit->second);
+                            base_reg = "rdx";
                         } else {
-                            emit(ss, "mov " + reg + ", " + resolved);
+                            base_reg = base;
+                        }
+                    }
+
+                    string mem = "byte [" + base_reg + " + " + idx_reg + "]";
+
+                    if (stmt.expr) {
+                        emit_expr(stmt.expr, "rax", ss, locals, params, var_types, local_types);
+                        emit(ss, "mov " + mem + ", al");
+                    } else {
+                        string v = stmt.var_value;
+                        if (v.size() == 3 && v[0] == '\'') {
+                            emit(ss, "mov " + mem + ", " + to_string((int)(unsigned char)v[1]));
+                        } else if (is_num_lit(v)) {
+                            emit(ss, "mov " + mem + ", " + v);
+                        } else {
+                            emit(ss, "mov rax, " + resolve_var(v, locals, params, var_types));
+                            emit(ss, "mov " + mem + ", al");
+                        }
+                    }
+                }
+                else {
+                    auto lit = locals.find(target);
+                    if (lit != locals.end()) {
+                        if (stmt.expr) {
+                            emit_expr(stmt.expr, lit->second, ss, locals, params, var_types, local_types);
+                        } else {
+                            string v = stmt.var_value;
+                            if (!v.empty() && (isdigit(v[0]) || (v.size() > 1 && v[0] == '-' && isdigit(v[1])))) {
+                                emit(ss, "mov " + lit->second + ", " + v);
+                            } else {
+                                emit(ss, "mov " + lit->second + ", " + resolve_var(v, locals, params, var_types));
+                            }
+                        }
+                    } else {
+                        if (stmt.expr) {
+                            emit_expr(stmt.expr, "rax", ss, locals, params, var_types, local_types);
+                            emit(ss, "mov [" + target + "], rax");
+                        } else {
+                            emit(ss, "mov rax, " + stmt.var_value);
+                            emit(ss, "mov [" + target + "], rax");
                         }
                     }
                 }
@@ -686,13 +1189,59 @@ void generate_block(const vector<ASTNode>& stmts, std::stringstream& ss, std::st
                 string val = stmt.var_value;
                 if (!val.empty()) {
                     if (val.size() >= 2 && val[0] == '"') {
-                        string label = "str_arg_" + to_string(data_counter++);
-                        string clean = val.substr(1, val.size() - 2);
-                        emit(extra_ss, label + " db " + escape_for_fasm(clean) + ",0");
-                        emit(ss, "lea rax, [" + label + "]");
+                        emit_string_literal(val, "rax", ss, extra_ss);
                     }
-                    else if (!val.empty() && (isdigit(val[0]) || (val.size() > 1 && val[0] == '-'))) {
+                    else if (is_num_lit(val)) {
                         emit(ss, "mov rax, " + val);
+                    }
+                    else if (val.find("(") != string::npos && val.find(")") != string::npos) {
+                        string func_name = trim(val.substr(0, val.find("(")));
+                        size_t open = val.find("(");
+                        size_t close = val.rfind(")");
+                        string args_str = val.substr(open + 1, close - open - 1);
+                        
+                        vector<string> call_args;
+                        string current;
+                        int depth = 0;
+                        for (size_t i = 0; i < args_str.size(); i++) {
+                            char c = args_str[i];
+                            if (c == '(' || c == '[') depth++;
+                            else if (c == ')' || c == ']') depth--;
+                            else if (c == ',' && depth == 0) {
+                                string trimmed = trim(current);
+                                if (!trimmed.empty()) call_args.push_back(trimmed);
+                                current.clear();
+                                continue;
+                            }
+                            current += c;
+                        }
+                        string trimmed = trim(current);
+                        if (!trimmed.empty()) call_args.push_back(trimmed);
+                        
+                        vector<string> arg_regs = TG.arg_regs;
+                        for (size_t i = 0; i < call_args.size() && i < arg_regs.size(); i++) {
+                            const string& arg = call_args[i];
+                            string arg_reg = arg_regs[i];
+                            
+                            auto lit = locals.find(arg);
+                            auto pit = params.find(arg);
+                            auto tit = var_types.find(arg);
+                            if (lit != locals.end()) {
+                                emit(ss, "mov " + arg_reg + ", " + lit->second);
+                            } else if (pit != params.end()) {
+                                emit(ss, "mov " + arg_reg + ", " + pit->second);
+                            } else if (tit != var_types.end() && is_string_type(tit->second)) {
+                                emit(ss, "lea " + arg_reg + ", [" + arg + "]");
+                            } else {
+                                emit(ss, "lea " + arg_reg + ", [" + arg + "]");
+                            }
+                        }
+                        
+                        if (defined_functions.find(func_name) != defined_functions.end()) {
+                            emit(ss, "call func_" + func_name);
+                        } else {
+                            emit(ss, "call [" + func_name + "]");
+                        }
                     }
                     else {
                         auto type_it = var_types.find(val);
@@ -733,7 +1282,7 @@ void generate_block(const vector<ASTNode>& stmts, std::stringstream& ss, std::st
 
                 emit_label(ss, start_label);
                 emit_condition(stmt.condition, ss, locals, params, var_types, end_label, extra_ss, local_types);
-                generate_block(stmt.body, ss, extra_ss, var_types, params, locals, local_types, local_regs, local_index, end_label, variadic_funcs, defined_functions);
+                generate_block(stmt.body, ss, extra_ss, var_types, params, locals, local_types, local_regs, local_index, end_label, defined_functions);
                 emit(ss, "jmp " + start_label);
                 emit_label(ss, end_label);
                 break;
@@ -746,12 +1295,12 @@ void generate_block(const vector<ASTNode>& stmts, std::stringstream& ss, std::st
                 if_counter++;
 
                 emit_condition(stmt.condition, ss, locals, params, var_types, else_label, extra_ss, local_types);
-                generate_block(stmt.body, ss, extra_ss, var_types, params, locals, local_types, local_regs, local_index, loop_end_label, variadic_funcs, defined_functions);
+                generate_block(stmt.body, ss, extra_ss, var_types, params, locals, local_types, local_regs, local_index, loop_end_label, defined_functions);
 
                 if (!stmt.else_body.empty()) {
                     emit(ss, "jmp " + end_label);
                     emit_label(ss, else_label);
-                    generate_block(stmt.else_body, ss, extra_ss, var_types, params, locals, local_types, local_regs, local_index, loop_end_label, variadic_funcs, defined_functions);
+                    generate_block(stmt.else_body, ss, extra_ss, var_types, params, locals, local_types, local_regs, local_index, loop_end_label, defined_functions);
                 }
                 else {
                     emit_label(ss, else_label);
@@ -767,21 +1316,7 @@ void generate_block(const vector<ASTNode>& stmts, std::stringstream& ss, std::st
                     args_str += stmt.args[i];
                 }
                 emit_comment(ss, "call function " + stmt.value + "(" + args_str + ")");
-                auto vit = variadic_funcs.find(stmt.value);
-                if (vit != variadic_funcs.end()) {
-                    generate_variadic_call(stmt, vit->second, ss, extra_ss, var_types, locals, local_types, params, defined_functions);
-                    for (const auto& body_stmt : vit->second.body) {
-                        if (body_stmt.type == NodeType::FUNC_CALL) {
-                            generate_func_call(body_stmt, ss, extra_ss, var_types, locals, params, defined_functions);
-                        }
-                        else if (body_stmt.type == NodeType::ASM_BLOCK) {
-                            generate_asm_block(body_stmt, ss, locals, params, var_types);
-                        }
-                    }
-                }
-                else {
-                    generate_func_call(stmt, ss, extra_ss, var_types, locals, params, defined_functions);
-                }
+                generate_func_call(stmt, ss, extra_ss, var_types, locals, local_types, params, defined_functions);
                 break;
             }
 
@@ -791,21 +1326,20 @@ void generate_block(const vector<ASTNode>& stmts, std::stringstream& ss, std::st
     }
 }
 
-// Generate main function entry point
-void generate_function(const ASTNode& node, std::stringstream& ss, std::stringstream& extra_ss, const map<string, string>& var_types, const map<string, ASTNode>& variadic_funcs, const map<string, bool>& defined_functions) {
+void generate_function(const ASTNode& node, stringstream& ss, stringstream& extra_ss, const map<string, string>& var_types, const map<string, bool>& defined_functions) {
     emit_label(ss, "start");
 
     bool has_locals = count_locals(node.body) > 0;
-    bool calls_funcs = has_func_calls(node.body) || has_asm_calls(node.body);
+    bool calls_funcs = needs_frame(node.body);
 
-    vector<string> param_regs = {"rcx", "rdx", "r8", "r9"};
+    vector<string> param_regs = TG.arg_regs;
     map<string, string> params;
-    for (size_t i = 0; i < node.params.size() && i < 4; i++) {
+    for (size_t i = 0; i < node.params.size() && i < param_regs.size(); i++) {
         params[node.params[i]] = param_regs[i];
     }
 
     int local_count = count_locals(node.body);
-    vector<string> local_regs = {"rbx", "r12", "r13", "r14", "r15", "rdi", "rsi", "rbp", "r9", "r10", "r11", "r8"};
+    vector<string> local_regs = TG.pool;
     int regs_needed = min(local_count, (int)local_regs.size());
     int local_index = 0;
     map<string, string> locals;
@@ -823,7 +1357,7 @@ void generate_function(const ASTNode& node, std::stringstream& ss, std::stringst
     }
 
     current_func_name = "main";
-    generate_block(node.body, ss, extra_ss, var_types, params, locals, local_types, local_regs, local_index, "", variadic_funcs, defined_functions);
+    generate_block(node.body, ss, extra_ss, var_types, params, locals, local_types, local_regs, local_index, "", defined_functions);
 
     if (has_locals || calls_funcs) {
         int alignment_padding = (regs_needed % 2 == 0) ? 8 : 0;
@@ -835,21 +1369,19 @@ void generate_function(const ASTNode& node, std::stringstream& ss, std::stringst
     }
 }
 
-// Generate named function definition
-void generate_func_def(const ASTNode& node, std::stringstream& ss, std::stringstream& extra_ss, const map<string, string>& var_types, const map<string, ASTNode>& variadic_funcs, const map<string, bool>& defined_functions) {
+void generate_func_def(const ASTNode& node, stringstream& ss, stringstream& extra_ss, const map<string, string>& var_types, const map<string, bool>& defined_functions) {
     ss << "\n";
     emit_label(ss, "func_" + node.value);
     
-    vector<string> param_regs = {"rcx", "rdx", "r8", "r9"};
+    vector<string> param_regs = TG.arg_regs;
     map<string, string> params;
-    for (size_t i = 0; i < node.params.size() && i < 4; i++) {
+    for (size_t i = 0; i < node.params.size() && i < param_regs.size(); i++) {
         params[node.params[i]] = param_regs[i];
     }
 
     int local_count = count_locals(node.body);
-    bool calls_funcs = has_func_calls(node.body) || has_asm_calls(node.body);
-
-    vector<string> local_regs = {"rbx", "r12", "r13", "r14", "r15", "rdi", "rsi", "rbp", "r9", "r10", "r11", "r8"};
+    bool calls_funcs = needs_frame(node.body);
+    vector<string> local_regs = TG.pool;
     int regs_needed = min(local_count, (int)local_regs.size());
     
     for (int i = 0; i < regs_needed; i++) {
@@ -857,10 +1389,10 @@ void generate_func_def(const ASTNode& node, std::stringstream& ss, std::stringst
     }
 
     int param_space = 0;
-    if (calls_funcs && node.params.size() > 0) {
+    if (node.params.size() > 0) {
         param_space = node.params.size() * 8;
         emit(ss, "sub rsp, " + to_string(param_space));
-        for (size_t i = 0; i < node.params.size() && i < 4; i++) {
+        for (size_t i = 0; i < node.params.size() && i < param_regs.size(); i++) {
             int offset = i * 8;
             emit(ss, "mov qword [rsp + " + to_string(offset) + "], " + param_regs[i]);
             params[node.params[i]] = "qword [rsp + " + to_string(offset) + "]";
@@ -871,12 +1403,17 @@ void generate_func_def(const ASTNode& node, std::stringstream& ss, std::stringst
     map<string, string> locals;
     map<string, string> local_types;
 
+    // Store parameter types in local_types so emit_expr knows about them (e.g., any[])
+    for (size_t i = 0; i < node.params.size() && i < node.param_types.size(); i++) {
+        local_types[node.params[i]] = node.param_types[i];
+    }
+
     current_func_name = node.value;
-    generate_block(node.body, ss, extra_ss, var_types, params, locals, local_types, local_regs, local_index, "", variadic_funcs, defined_functions);
+    generate_block(node.body, ss, extra_ss, var_types, params, locals, local_types, local_regs, local_index, "", defined_functions);
 
     emit_label(ss, ".func_end_" + node.value);
 
-    if (calls_funcs && node.params.size() > 0) {
+    if (node.params.size() > 0) {
         int param_space = node.params.size() * 8;
         emit(ss, "add rsp, " + to_string(param_space));
     }
@@ -888,17 +1425,14 @@ void generate_func_def(const ASTNode& node, std::stringstream& ss, std::stringst
     emit(ss, "ret");
 }
 
-// Convert WiseL type to FASM directive
 string type_to_fasm(const string& type) {
-    if (type == "i8" || type == "u8" || type == "char") return "db";
-    if (type == "i16" || type == "u16") return "dw";
-    if (type == "i32" || type == "u32") return "dd";
-    if (type == "i64" || type == "u64" || type == "i128" || type == "u128") return "dq";
+    const TypeInfo* ti = lookup_type(type);
+    if (ti) return ti->fasm_dir;
+    if (type == "char") return "db";
     return "dq";
 }
 
-// Generate .data section
-void generate_data_section(const vector<ASTNode>& nodes, std::stringstream& ss, const string& extra_data) {
+void generate_data_section(const vector<ASTNode>& nodes, stringstream& ss, const string& extra_data) {
     ss << "section '.data' data readable writeable\n";
     emit(ss, "wisel_v1 dd ?");
     for (const auto& node : nodes) {
@@ -931,12 +1465,46 @@ void generate_data_section(const vector<ASTNode>& nodes, std::stringstream& ss, 
                 emit(ss, name + "_len dd " + to_string(display_len));
             }
             else if (value.size() >= 2 && value.front() == '[' && value.back() == ']') {
-                string size_str = value.substr(1, value.size() - 2);
-                string clean_size;
-                for (char c : size_str) {
-                    if (c != ' ') clean_size += c;
+                string content = value.substr(1, value.size() - 2);
+                
+                if (content.find(',') != string::npos || (content.size() > 0 && content.find("dup") == string::npos && isdigit(content[0]) == 0)) {
+                    vector<string> elements;
+                    string current;
+                    for (size_t i = 0; i < content.size(); i++) {
+                        if (content[i] == ',' ) {
+                            if (!current.empty()) {
+                                elements.push_back(current);
+                                current.clear();
+                            }
+                        } else {
+                            current += content[i];
+                        }
+                    }
+                    if (!current.empty()) elements.push_back(current);
+                    
+                    emit(ss, name + "_len dd " + to_string(elements.size()));
+                    
+                    if (is_string_type(type.substr(0, type.size() - 2))) {
+                        for (size_t i = 0; i < elements.size(); i++) {
+                            string elem = elements[i];
+                            if (elem.size() >= 2 && elem[0] == '"' && elem.back() == '"') {
+                                string raw = elem.substr(1, elem.size() - 2);
+                                emit(ss, name + "_item_" + to_string(i) + " db " + escape_for_fasm(raw) + ",0");
+                            }
+                        }
+                        emit(ss, name + " dq " + to_string(elements.size()) + " dup(?)");
+                    } else {
+                        emit(ss, name + " " + type_to_fasm(type.substr(0, type.size() - 2)) + " " + to_string(elements.size()) + " dup(?)");
+                    }
                 }
-                emit(ss, name + " " + type_to_fasm(type) + " " + clean_size + " dup(?)");
+                else {
+                    string size_str = content;
+                    string clean_size;
+                    for (char c : size_str) {
+                        if (c != ' ') clean_size += c;
+                    }
+                    emit(ss, name + " " + type_to_fasm(type) + " " + clean_size + " dup(?)");
+                }
             }
             else {
                 string fasm_value = value.empty() ? "?" : value;
@@ -948,8 +1516,7 @@ void generate_data_section(const vector<ASTNode>& nodes, std::stringstream& ss, 
     ss << "\n";
 }
 
-// Generate .idata section
-void generate_import_section(const vector<ASTNode>& nodes, std::stringstream& ss) {
+void generate_import_section(const vector<ASTNode>& nodes, stringstream& ss) {
     map<string, vector<string>> dll_imports;
     vector<string> dll_order;
 
@@ -998,18 +1565,17 @@ void generate_import_section(const vector<ASTNode>& nodes, std::stringstream& ss
     ss << library_line << "\n" << import_blocks;
 }
 
-// Main code generation entry point
 string generate(const vector<ASTNode>& nodes) {
-    string format_str = "PE64 CONSOLE";
+    string format_str;
     bool has_main = false;
-    std::stringstream text_ss;
-    std::stringstream extra_ss;
+    stringstream text_ss;
+    stringstream extra_ss;
     
     data_counter = 0;
     func_return_types.clear();
+    func_param_types.clear();
 
     map<string, string> var_types;
-    map<string, ASTNode> variadic_funcs;
     map<string, bool> defined_functions;
 
     for (const auto& node : nodes) {
@@ -1019,31 +1585,37 @@ string generate(const vector<ASTNode>& nodes) {
     }
 
     for (const auto& node : nodes) {
-        if (node.type == NodeType::FORMAT) {
+        if (node.type == NodeType::FORMAT && format_str.empty()) {
             format_str = node.value;
         }
         else if (node.type == NodeType::FUNC_DEF) {
-            if (node.is_variadic) variadic_funcs[node.value] = node;
             if (!node.return_type.empty()) func_return_types[node.value] = node.return_type;
+            if (!node.param_types.empty()) func_param_types[node.value] = node.param_types;
         }
         else if (node.type == NodeType::LET_STMT && (node.is_static || !node.is_func_local)) {
             var_types[node.var_name] = node.var_type;
         }
     }
 
+    if (format_str.empty()) format_str = "PE64 Console";
     string clean_format = format_str;
     if (clean_format.size() >= 2 && clean_format.front() == '"' && clean_format.back() == '"') {
         clean_format = clean_format.substr(1, clean_format.size() - 2);
     }
 
+    string low = clean_format;
+    for (auto& c : low) c = tolower(c);
+    if (low.find("pe64") != string::npos) TG = WIN64;
+    else { cerr << "[ERROR] Unknown target: " << clean_format << " (use PE64 Console)" << endl; exit(1); }
+
     for (const auto& node : nodes) {
         if (node.type == NodeType::FUNC_DEF) {
             if (node.value == "main") {
                 has_main = true;
-                generate_function(node, text_ss, extra_ss, var_types, variadic_funcs, defined_functions);
+                generate_function(node, text_ss, extra_ss, var_types, defined_functions);
             }
-            else if (!node.is_variadic) {
-                generate_func_def(node, text_ss, extra_ss, var_types, variadic_funcs, defined_functions);
+            else {
+                generate_func_def(node, text_ss, extra_ss, var_types, defined_functions);
             }
         }
     }
@@ -1053,8 +1625,8 @@ string generate(const vector<ASTNode>& nodes) {
         emit(text_ss, "invoke ExitProcess, 0");
     }
 
-    std::stringstream ss;
-    ss << "format " << clean_format << "\n";
+    stringstream ss;
+    ss << "format " << TG.fasm_format << "\n";
     ss << "entry start\n\n";
     
     for (const auto& node : nodes) {

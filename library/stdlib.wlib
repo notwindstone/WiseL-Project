@@ -1,3 +1,5 @@
+Format "PE64 Console"
+
 @include.inc {
     "win64w.inc"
 }
@@ -5,6 +7,7 @@
 @library kernel32 {
     GetStdHandle
     WriteConsoleA
+    ReadConsoleA
     ReadConsoleW
     FlushConsoleInputBuffer
     WideCharToMultiByte
@@ -21,151 +24,20 @@ static newline: str = "\r\n"
 static readBuffer: i8 = [512]
 static tempWide: i16 = [256]
 static numBuffer: i8 = [32]
+static bytesWritten: u32 = 0
+static charsRead: u32 = 0
+static buf1: i8 = [512]
+static buf2: i8 = [512]
+static buf3: i8 = [512]
 
 func GetStdHandle() {
     asm {
+        sub rsp, 40
         invoke GetStdHandle, -11
         mov [hStdOut], rax
         invoke GetStdHandle, -10
         mov [hStdIn], rax
-    }
-}
-
-func SetConsoleOutputCP() {
-    asm {
-        invoke SetConsoleOutputCP, 65001
-    }
-}
-
-func readln() -> str {
-    asm {
-        sub rsp, 64
-        invoke FlushConsoleInputBuffer, [hStdIn]
-        lea rdx, [tempWide]
-        invoke ReadConsoleW, [hStdIn], rdx, 255, readLen, 0
-    }
-    let chars: i32 = readLen
-    if (chars == 0) {
-        asm {
-            mov byte [readBuffer], 0
-        }
-    } else {
-        asm {
-            mov ecx, 65001
-            xor edx, edx
-            lea r8, [tempWide]
-            mov r9d, [readLen]
-            lea rax, [readBuffer]
-            mov [rsp + 32], rax
-            mov dword [rsp + 40], 512
-            mov qword [rsp + 48], 0
-            mov qword [rsp + 56], 0
-            call [WideCharToMultiByte]
-            mov [readLen], eax
-        }
-
-        let converted: i32 = readLen
-
-        if (converted < 2) {
-            asm {
-                mov byte [readBuffer], 0
-            }
-        } else {
-            asm {
-                mov ecx, [readLen]
-                lea rax, [readBuffer]
-                mov byte [rax + rcx - 1], 0
-                mov byte [rax + rcx - 2], 0
-            }
-        }
-    }
-
-    asm {
-        lea rax, [readBuffer]
-        add rsp, 64
-        jmp .func_end_readln
-    }
-}
-
-func print_str(str text) {
-    asm {
-        push rbx
-        mov rbx, rcx
-        invoke lstrlenA, rcx
-        mov r8, rax
-        invoke WriteConsoleA, [hStdOut], rbx, r8, written, 0
-        pop rbx
-        ret
-    }
-}
-
-func print_int(i32 num) {
-    asm {
-        push rbx
-        push r12
-        mov eax, ecx
-        xor r12d, r12d
-        test eax, eax
-        jns .pi_pos
-        neg eax
-        mov r12d, 1
-    .pi_pos:
-        lea rbx, [numBuffer + 32]
-        dec rbx
-        mov byte [rbx], 0
-    .pi_div:
-        xor edx, edx
-        mov ecx, 10
-        div ecx
-        add dl, '0'
-        dec rbx
-        mov byte [rbx], dl
-        test eax, eax
-        jnz .pi_div
-        test r12d, r12d
-        jz .pi_write
-        dec rbx
-        mov byte [rbx], '-'
-    .pi_write:
-        lea r8, [numBuffer + 32]
-        sub r8, rbx
-        invoke WriteConsoleA, [hStdOut], rbx, r8, written, 0
-        pop r12
-        pop rbx
-        ret
-    }
-}
-
-func println(args[] ... ) {
-    @args[] {
-        if (args[].type == str) {
-            print_str(args[str].value)
-        }
-        if (args[].type == int) {
-            print_int(args[int].value)
-        }
-    }
-    asm {
-        invoke WriteConsoleA, [hStdOut], newline, 2, written, 0
-    }
-}
-
-func printf(str text) {
-    asm {
-        push rbx
-        mov rbx, rcx
-        invoke lstrlenA, rcx
-        mov r8, rax
-        invoke WriteConsoleA, [hStdOut], rbx, r8, written, 0
-        pop rbx
-        ret
-    }
-}
-
-func endline() {
-    asm {
-        invoke WriteConsoleA, [hStdOut], newline, 2, written, 0
-        ret
+        add rsp, 40
     }
 }
 
@@ -173,4 +45,119 @@ func ExitProcess() {
     asm {
         invoke ExitProcess, 0
     }
+}
+
+func strlen(str text) -> u32 {
+    asm {
+        sub rsp, 40
+        invoke lstrlenA, rcx
+        add rsp, 40
+    }
+}
+
+func __len(ptr arr) -> i64 {
+    asm {
+        mov rax, [rcx - 8]
+    }
+}
+func __val(any elem) -> i64 {
+    asm {
+        mov rax, [rcx + 8]
+    }
+}
+func __type(any elem) -> i32 {
+    asm {
+        mov rax, [rcx]
+    }
+}
+
+func len(str text) -> u32 {
+    return strlen(text)
+}
+
+func atoi(str text) -> i32 {
+    let result: i32 = 0
+    let i: i32 = 0
+    let sign: i32 = 1
+    if (text[0] == '-') {
+        sign = 0 - sign
+        i++
+    }
+    while (true) {
+        let c: i32 = text[i]
+        if (c == 0) { break }
+        if (c < '0') { break }
+        if (c > '9') { break }
+        result = result * 10 + (c - '0')
+        i++
+    }
+    return result * sign
+}
+
+func print_int(i32 num) {
+    let n: i32 = num
+    let idx: i32 = 0
+    let divisor: i32 = 1
+
+    if (n < 0) {
+        n = 0 - n
+        numBuffer[0] = '-'
+        idx = 1
+    }
+
+    let m: i32 = n
+    while (m > 9) {
+        divisor = divisor * 10
+        m = m / 10
+    }
+
+    while (true) {
+        let d: i32 = n / divisor
+        numBuffer[idx] = d + '0'
+        n = n % divisor
+        divisor = divisor / 10
+        idx = idx + 1
+        if (divisor == 0) {
+            break
+        }
+    }
+
+    WriteConsole(hStdOut, numBuffer, idx, &bytesWritten)
+}
+
+func WriteConsole(i64 hConsole, str text, u32 len, *u32 bytesWritten) {
+    asm {
+        sub rsp, 40
+        invoke WriteConsoleA, rcx, rdx, r8, r9, 0
+        add rsp, 40
+    }
+}
+
+func println(any[] args) {
+    let i: i32 = 0
+    let count: i32 = __len(args)
+    while (i < count) {
+        let elem: i64 = args[i]
+        let t: i32 = __type(elem)
+        let v: i64 = __val(elem)
+        if (t == 0) {
+            print_int(v)
+        }
+        if (t == 1) {
+            printf(v)
+        }
+        printf(" ")
+        i++
+    }
+    printf("\n")
+}
+
+func printf(str text) {
+    let len: u32 = strlen(text)
+    WriteConsole(hStdOut, text, len, &bytesWritten)
+}
+
+func scanf(str buf) -> str {
+    ReadConsoleA(hStdIn, buf, 511, &charsRead, 0)
+    return buf
 }
