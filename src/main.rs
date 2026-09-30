@@ -14,12 +14,12 @@ fn main() {
     let source: String = read_file(&path);
     print_step(Step::READ, source.len());
 
-    tokenize(&source);
-    print_step(Step::TOKENIZED, 0);
+    let tokens: Vec<Token> = tokenize(&source);
+    print_step(Step::TOKENIZED, tokens.len());
 
-    parse();
-    print_step(Step::PARSED, 0);
+    let ast: Vec<ASTNode> = parse();
+    print_step(Step::PARSED, ast.len());
 
-    generate();
-    print_step(Step::GENERATED, 0);
+    let asm: String = generate();
+    print_step(Step::GENERATED, asm.len());
 }
