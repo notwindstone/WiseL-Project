@@ -228,9 +228,65 @@ pub fn tokenize(source: &str) -> Vec<Token> {
         // If we got to this branch, then the current byte
         // can be '@', '.', ':', and something unknown
         match current_byte {
-            b'@' => { pos += 1},
-            b'.' => { pos += 1 },
-            b':' => { pos += 1 },
+            b'@' => {
+                pos += 1;
+
+                let token = if pos < bytes_view.len() && bytes_view[pos].is_ascii_alphabetic() {
+                    let word = read_identifier(source, bytes_view, &mut pos);
+                    let start = pos;
+
+                    while pos < bytes_view.len() &&
+                        matches!(bytes_view[pos], b' ' | b'\t' | b'\n' | b'\r' | b'{') != true {
+                        pos += 1;
+                    }
+
+                    Token {
+                        kind : TokenKind::DIRECTIVE,
+                        value: format!("{word}{}", &source[start..pos]),
+                    }
+                } else {
+                    Token { kind : TokenKind::IDENT, value: char::from(current_byte).to_string() }
+                };
+
+                tokens.push(token);
+            },
+            b'.' => {
+                pos += 1;
+
+                let token = if pos < bytes_view.len() && bytes_view[pos].is_ascii_digit() {
+                    Token {
+                        kind : TokenKind::NUMBER,
+                        value: format!(".{}", read_number(source, bytes_view, &mut pos)),
+                    }
+                } else if pos < bytes_view.len() && (
+                    bytes_view[pos].is_ascii_alphabetic() || bytes_view[pos] == b'_'
+                ) {
+                    Token {
+                        kind : TokenKind::IDENT,
+                        value: format!(".{}", read_identifier(source, bytes_view, &mut pos)),
+                    }
+                } else {
+                    Token { kind: TokenKind::DOT, value: String::from(".") }
+                };
+
+                tokens.push(token);
+            },
+            b':' => {
+                pos += 1;
+
+                let token = if pos < bytes_view.len() && (
+                    bytes_view[pos].is_ascii_alphabetic() || bytes_view[pos] == b'_'
+                ) {
+                    Token {
+                        kind : TokenKind::IDENT,
+                        value: format!(":{}", read_identifier(source, bytes_view, &mut pos)),
+                    }
+                } else {
+                    Token { kind: TokenKind::COLON, value: String::from(":") }
+                };
+
+                tokens.push(token);
+            },
 
             _byte if _byte.is_ascii_digit()      => {
                 tokens.push(Token {
