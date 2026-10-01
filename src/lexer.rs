@@ -72,12 +72,18 @@ fn read_string(source: &str, bytes_view: &[u8], pos: &mut usize) -> Result<Strin
 
     // We are borrowing a slice without any memory re-allocations
     for current_byte in &bytes_view[start..] {
+        // 'start' is at the opening quote index, so skip that quote
+        if *pos == start {
+            *pos += 1;
+            continue;
+        }
+
         *pos += 1;
 
-        if escaped { escaped = false; }
-        // 'start' is at the opening quote index, so skip that quote.
-        // Also skip to the next byte if the character was escaped
-        if escaped || *pos == start { continue; }
+        if escaped {
+            escaped = false;
+            continue;
+        }
 
         match *current_byte {
             _byte if _byte == quote => return Ok(source[start..*pos].to_owned()),
@@ -210,19 +216,21 @@ pub fn tokenize(source: &str) -> Vec<Token> {
                         std::process::exit(1);
                     }
                 }
-            } else { char::from(current_byte).to_string() };
+            } else {
+                pos += 1;
+                char::from(current_byte).to_string()
+            };
 
             tokens.push(Token { kind: token_kind, value: token_value });
-            pos += 1;
             continue;
         }
 
         // If we got to this branch, then the current byte
         // can be '@', '.', ':', and something unknown
         match current_byte {
-            b'@' => {},
-            b'.' => {},
-            b':' => {},
+            b'@' => { pos += 1},
+            b'.' => { pos += 1 },
+            b':' => { pos += 1 },
 
             _byte if _byte.is_ascii_digit()      => {
                 tokens.push(Token {
@@ -230,7 +238,7 @@ pub fn tokenize(source: &str) -> Vec<Token> {
                     value: read_number(source, bytes_view, &mut pos),
                 });
             },
-            _byte if _byte.is_ascii_alphabetic() => {
+            _byte if _byte.is_ascii_alphabetic() || _byte == b'_' => {
                 let word = read_identifier(source, bytes_view, &mut pos);
                 let token_kind = get_keyword_type(&word);
 
